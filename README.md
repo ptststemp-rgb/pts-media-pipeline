@@ -24,3 +24,24 @@ for the stage that is running.
 
 `scripts/pts_pipeline.py` uses only the Python standard library, so there is
 nothing to install.
+
+## Where files end up
+
+The VPS moves each finished file to the Pi (`PI_MOVIE_DIR` / `PI_SERIES_DIR`,
+`/DATA/Movie` and `/DATA/Series` by default):
+
+```
+/DATA/Movie/<Title> (<Year>)/<Title> (<Year>).mkv
+/DATA/Series/<Title>/Season <NN>/<Title> S<NN>E<NN>.mkv
+```
+
+Movie vs. series, title and year all come from the metadata saved when the job
+was queued. The encoder command is:
+
+```
+ffmpeg -i source \
+  -map 0:v:0 -map 0:a? -map 0:s? -map_metadata 0 \
+  -c:v libx265 -preset medium -crf 26 -vf "scale=-2:min(540,ih)" \
+  -c:a aac -b:a 256k -c:s copy \
+  -max_muxing_queue_size 4096 out.mkv
+```
