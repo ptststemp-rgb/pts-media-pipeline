@@ -34,6 +34,8 @@ def _bail(message):
 def report(**fields):
     """Best-effort progress callback to the worker API."""
     payload = {"job_id": JOB_ID}
+    if ATTEMPT:
+        payload["attempt"] = ATTEMPT
     for key, value in fields.items():
         if value is not None:
             payload[key] = value
@@ -45,6 +47,13 @@ def report(**fields):
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 409):
+            # The job was retried, edited or removed while this runner was
+            # working: stop instead of burning the rest of the run.
+            print("job %s is gone or superseded, stopping" % JOB_ID, file=sys.stderr)
+            sys.exit(0)
+        print("progress post failed: %s" % exc, file=sys.stderr)
     except Exception as exc:  # progress must never kill the run
         print("progress post failed: %s" % exc, file=sys.stderr)
 
@@ -210,8 +219,8 @@ def upload(path):
             seq += 1
             end = fh.tell()
             is_last = 1 if end >= size else 0
-            url = "%s/worker/upload?job=%s&seq=%d&last=%d&ext=.mkv" % (
-                CALLBACK, JOB_ID, seq, is_last)
+            url = "%s/worker/upload?job=%s&seq=%d&last=%d&ext=.mkv&attempt=%s" % (
+                CALLBACK, JOB_ID, seq, is_last, ATTEMPT)
             req = urllib.request.Request(url, data=chunk, method="POST")
             req.add_header("Content-Type", "application/octet-stream")
             req.add_header("Authorization", "Bearer " + TOKEN)
@@ -220,6 +229,9 @@ def upload(path):
                 with urllib.request.urlopen(req, timeout=900) as resp:
                     resp.read()
             except urllib.error.HTTPError as exc:
+                if exc.code == 409:
+                    print("job superseded by a newer attempt, stopping", file=sys.stderr)
+                    sys.exit(0)
                 _bail("upload rejected (%s): %s" % (exc.code, exc.read()[:300]))
             except Exception as exc:
                 _bail("upload failed: %s" % exc)
@@ -269,6 +281,7 @@ if __name__ == "__main__":
     SOURCE_URL = os.environ.get("SOURCE_URL", "")
     LABEL = os.environ.get("LABEL") or os.environ.get("MEDIA_TITLE") or "job"
     RUN_ID = os.environ.get("GITHUB_RUN_ID", "")
+    ATTEMPT = os.environ.get("ATTEMPT", "").strip()
     if "--report-failure" not in sys.argv and not SOURCE_URL:
         print("SOURCE_URL is required", file=sys.stderr)
         sys.exit(2)
