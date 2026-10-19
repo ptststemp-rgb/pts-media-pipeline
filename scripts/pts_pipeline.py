@@ -21,7 +21,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-CHUNK = 64 * 1024 * 1024  # 64 MiB - safely under Cloudflare's 100 MB body cap
+CHUNK = 8 * 1024 * 1024  # 8 MiB: keeps every request well inside Cloudflare's ~100s window
+CHUNK_RETRIES = 6
 USER_AGENT = "pts-runner"
 
 
@@ -76,7 +77,25 @@ def parse_hms(text):
 # ---------------------------------------------------------------------------
 # stage 1: download
 # ---------------------------------------------------------------------------
+DOWNLOAD_RETRIES = 3
+
+
 def download(url, dest):
+    """Fetch the source, retrying a few times before giving up."""
+    last_err = None
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        try:
+            return download_once(url, dest)
+        except Exception as exc:
+            last_err = exc
+            print("download attempt %d failed: %s" % (attempt, exc), file=sys.stderr)
+            if attempt < DOWNLOAD_RETRIES:
+                report(stage="downloading", progress=0, message="Retrying download")
+                time.sleep(5 * attempt)
+    _bail("download failed: %s" % last_err)
+
+
+def download_once(url, dest):
     print("downloading: %s" % url)
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -115,7 +134,7 @@ def download(url, dest):
     size = os.path.getsize(dest)
     print("downloaded %s bytes" % size)
     if size == 0:
-        _bail("the download produced an empty file")
+        raise RuntimeError("the download produced an empty file")
     report(stage="downloading", progress=100, file_size=size,
            speed_bps=0, eta_seconds=0, message=human(size))
     return size
@@ -205,6 +224,15 @@ def compress(src, dst):
 # ---------------------------------------------------------------------------
 # stage 3: upload the compressed file to the VPS in chunks
 # ---------------------------------------------------------------------------
+def send_chunk(url, chunk):
+    req = urllib.request.Request(url, data=chunk, method="POST")
+    req.add_header("Content-Type", "application/octet-stream")
+    req.add_header("Authorization", "Bearer " + TOKEN)
+    req.add_header("User-Agent", USER_AGENT)
+    with urllib.request.urlopen(req, timeout=900) as resp:
+        resp.read()
+
+
 def upload(path):
     size = os.path.getsize(path)
     started = time.time()
@@ -219,22 +247,34 @@ def upload(path):
             seq += 1
             end = fh.tell()
             is_last = 1 if end >= size else 0
+            # A fresh URL per attempt: proxies occasionally drop a request, and
+            # re-sending the same sequence number simply replaces that part.
             url = "%s/worker/upload?job=%s&seq=%d&last=%d&ext=.mkv&attempt=%s" % (
                 CALLBACK, JOB_ID, seq, is_last, ATTEMPT)
-            req = urllib.request.Request(url, data=chunk, method="POST")
-            req.add_header("Content-Type", "application/octet-stream")
-            req.add_header("Authorization", "Bearer " + TOKEN)
-            req.add_header("User-Agent", USER_AGENT)
-            try:
-                with urllib.request.urlopen(req, timeout=900) as resp:
-                    resp.read()
-            except urllib.error.HTTPError as exc:
-                if exc.code == 409:
-                    print("job superseded by a newer attempt, stopping", file=sys.stderr)
-                    sys.exit(0)
-                _bail("upload rejected (%s): %s" % (exc.code, exc.read()[:300]))
-            except Exception as exc:
-                _bail("upload failed: %s" % exc)
+
+            delay = 2
+            last_err = "upload failed"
+            for attempt in range(1, CHUNK_RETRIES + 1):
+                try:
+                    send_chunk(url, chunk)
+                    last_err = None
+                    break
+                except urllib.error.HTTPError as exc:
+                    if exc.code in (404, 409):
+                        print("job superseded or removed, stopping", file=sys.stderr)
+                        sys.exit(0)
+                    body = exc.read()[:200]
+                    last_err = "upload rejected (%s): %s" % (exc.code, body)
+                    print("chunk %d attempt %d: %s" % (seq, attempt, last_err), file=sys.stderr)
+                except Exception as exc:
+                    last_err = "upload failed: %s" % exc
+                    print("chunk %d attempt %d: %s" % (seq, attempt, last_err), file=sys.stderr)
+                if attempt < CHUNK_RETRIES:
+                    time.sleep(delay)
+                    delay = min(30, delay * 2)
+            if last_err:
+                _bail(last_err)
+
             sent = end
             speed = int(sent / max(0.001, time.time() - started))
             if is_last:
