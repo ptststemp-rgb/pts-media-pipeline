@@ -12,6 +12,7 @@ Stages reported:
 The VPS owns the final stages (to_pi, done) once the upload lands.
 """
 import json
+import math
 import os
 import subprocess
 import sys
@@ -92,7 +93,12 @@ def download(url, dest):
             last = now
             speed = int(done / max(0.001, now - started))
             eta = int((total - done) / speed) if (total and speed) else None
-            pct = (done / total * 100) if total else None
+            if total:
+                pct = done / total * 100
+            else:
+                # No Content-Length: creep towards 95% on elapsed time so the
+                # queue still shows a real 0-100 bar instead of a stuck one.
+                pct = min(95.0, 100.0 * (1.0 - math.exp(-(now - started) / 120.0)))
             msg = human(done) + (" / " + human(total) if total else "")
             report(stage="downloading", progress=pct, speed_bps=speed,
                    eta_seconds=eta, file_size=done, message=msg)
@@ -101,6 +107,8 @@ def download(url, dest):
     print("downloaded %s bytes" % size)
     if size == 0:
         _bail("the download produced an empty file")
+    report(stage="downloading", progress=100, file_size=size,
+           speed_bps=0, eta_seconds=0, message=human(size))
     return size
 
 
@@ -116,6 +124,7 @@ def probe_duration(path):
 
 
 def compress(src, dst):
+    started = time.time()
     try:
         duration = probe_duration(src)
     except Exception as exc:
@@ -158,7 +167,8 @@ def compress(src, dst):
             done_s = parse_hms(value)
         except ValueError:
             continue
-        pct = min(99.0, done_s / duration * 100) if duration else None
+        pct = min(99.9, done_s / duration * 100) if duration else min(
+            99.9, 100.0 * (1.0 - math.exp(-(time.time() - started) / 600.0)))
         try:
             factor = float(state.get("speed", "").rstrip("x"))
         except ValueError:
@@ -178,6 +188,8 @@ def compress(src, dst):
 
     size = os.path.getsize(dst)
     print("compressed to %s bytes" % size)
+    report(stage="compressing", progress=100, eta_seconds=0,
+           message=human(size), out_size=size)
     return size
 
 
@@ -189,6 +201,7 @@ def upload(path):
     started = time.time()
     sent = 0
     seq = 0
+    report(stage="uploading", progress=0, out_size=size, message="Sending to VPS")
     with open(path, "rb") as fh:
         while True:
             chunk = fh.read(CHUNK)
@@ -211,9 +224,12 @@ def upload(path):
             except Exception as exc:
                 _bail("upload failed: %s" % exc)
             sent = end
-            if is_last:
-                break  # the VPS takes over from here (to_pi -> done)
             speed = int(sent / max(0.001, time.time() - started))
+            if is_last:
+                # Everything is on the VPS: report a full bar and hand over.
+                report(stage="uploading", progress=100, speed_bps=speed,
+                       eta_seconds=0, out_size=size, message="Sent to VPS")
+                break  # the VPS takes over from here (to_pi -> done)
             eta = int((size - sent) / speed) if speed else None
             report(stage="uploading", progress=sent / size * 100,
                    speed_bps=speed, eta_seconds=eta, out_size=size)
