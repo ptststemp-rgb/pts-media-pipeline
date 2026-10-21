@@ -11,6 +11,7 @@ Stages reported:
     uploading    pct, speed, eta, out_size
 The VPS owns the final stages (to_pi, done) once the upload lands.
 """
+import http.client
 import json
 import math
 import os
@@ -18,10 +19,11 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
-CHUNK = 8 * 1024 * 1024  # 8 MiB: keeps every request well inside Cloudflare's ~100s window
+CHUNK = 16 * 1024 * 1024  # bigger parts mean fewer requests and a warm TCP window
 CHUNK_RETRIES = 6
 USER_AGENT = "pts-runner"
 
@@ -151,6 +153,19 @@ def probe_duration(path):
     return float(out.stdout.strip())
 
 
+def probe_video(path):
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name,height", "-of", "csv=p=0:s=,", path],
+            capture_output=True, text=True, check=True)
+        codec, _, height = out.stdout.strip().partition(",")
+        return codec.strip().lower(), int(height or 0)
+    except Exception as exc:
+        print("video probe failed: %s" % exc, file=sys.stderr)
+        return "", 0
+
+
 def compress(src, dst):
     started = time.time()
     try:
@@ -159,19 +174,24 @@ def compress(src, dst):
         print("duration probe failed: %s" % exc, file=sys.stderr)
         duration = 0.0
 
-    cmd = [
-        "ffmpeg", "-hide_banner", "-y", "-i", src,
-        "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?",
-        "-map_metadata", "0",
-        "-c:v", "libx265", "-preset", "medium", "-crf", "26",
-        "-vf", "scale=-2:min(540\\,ih)",
-        "-c:a", "aac", "-b:a", "256k",
-        "-c:s", "copy",
-        "-max_muxing_queue_size", "4096",
-        "-progress", "pipe:1", "-nostats",
-        dst,
-    ]
-    report(stage="compressing", progress=0, message="Starting encoder")
+    cmd = ["ffmpeg", "-hide_banner", "-y", "-i", src,
+           "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?",
+           "-map_metadata", "0"]
+    codec, height = probe_video(src)
+    if codec in ("hevc", "h265") and 0 < height <= 540:
+        # Already the target codec and size: a stream copy finishes in seconds.
+        cmd += ["-c:v", "copy"]
+        report(stage="compressing", progress=0, message="Source already 540p HEVC")
+    else:
+        cmd += [
+            "-c:v", "libx265", "-preset", "veryfast", "-crf", "27",
+            "-vf", "scale=-2:min(540\\,ih)",
+            "-x265-params", "log-level=error:wpp=1",
+            "-max_muxing_queue_size", "4096",
+        ]
+        report(stage="compressing", progress=0, message="Starting encoder")
+    cmd += ["-c:a", "aac", "-b:a", "256k", "-c:s", "copy",
+            "-progress", "pipe:1", "-nostats", dst]
 
     log = open("work/ffmpeg.log", "w+")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log,
@@ -224,13 +244,49 @@ def compress(src, dst):
 # ---------------------------------------------------------------------------
 # stage 3: upload the compressed file to the VPS in chunks
 # ---------------------------------------------------------------------------
-def send_chunk(url, chunk):
-    req = urllib.request.Request(url, data=chunk, method="POST")
-    req.add_header("Content-Type", "application/octet-stream")
-    req.add_header("Authorization", "Bearer " + TOKEN)
-    req.add_header("User-Agent", USER_AGENT)
-    with urllib.request.urlopen(req, timeout=900) as resp:
-        resp.read()
+class ChunkError(Exception):
+    def __init__(self, code, body):
+        super().__init__("upload rejected (%s): %s" % (code, body))
+        self.code = code
+
+
+class Uploader:
+    """One warm HTTPS connection shared by every chunk of a file."""
+
+    def __init__(self, base):
+        parts = urllib.parse.urlsplit(base)
+        self.secure = parts.scheme == "https"
+        self.host = parts.hostname
+        self.port = parts.port
+        self.path = parts.path.rstrip("/") + "/worker/upload"
+        self.conn = None
+
+    def close(self):
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+    def post(self, query, chunk):
+        if self.conn is None:
+            factory = http.client.HTTPSConnection if self.secure else http.client.HTTPConnection
+            self.conn = factory(self.host, self.port, timeout=900)
+        try:
+            self.conn.request("POST", self.path + "?" + query, body=chunk, headers={
+                "Content-Type": "application/octet-stream",
+                "Authorization": "Bearer " + TOKEN,
+                "User-Agent": USER_AGENT,
+                "Connection": "keep-alive",
+            })
+            resp = self.conn.getresponse()
+            body = resp.read()
+            if resp.status >= 400:
+                raise ChunkError(resp.status, body[:300])
+        except Exception:
+            self.close()
+            raise
 
 
 def upload(path):
@@ -238,53 +294,55 @@ def upload(path):
     started = time.time()
     sent = 0
     seq = 0
+    up = Uploader(CALLBACK)
     report(stage="uploading", progress=0, out_size=size, message="Sending to VPS")
-    with open(path, "rb") as fh:
-        while True:
-            chunk = fh.read(CHUNK)
-            if not chunk:
-                break
-            seq += 1
-            end = fh.tell()
-            is_last = 1 if end >= size else 0
-            # A fresh URL per attempt: proxies occasionally drop a request, and
-            # re-sending the same sequence number simply replaces that part.
-            url = "%s/worker/upload?job=%s&seq=%d&last=%d&ext=.mkv&attempt=%s" % (
-                CALLBACK, JOB_ID, seq, is_last, ATTEMPT)
-
-            delay = 2
-            last_err = "upload failed"
-            for attempt in range(1, CHUNK_RETRIES + 1):
-                try:
-                    send_chunk(url, chunk)
-                    last_err = None
+    try:
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(CHUNK)
+                if not chunk:
                     break
-                except urllib.error.HTTPError as exc:
-                    if exc.code in (404, 409):
-                        print("job superseded or removed, stopping", file=sys.stderr)
-                        sys.exit(0)
-                    body = exc.read()[:200]
-                    last_err = "upload rejected (%s): %s" % (exc.code, body)
-                    print("chunk %d attempt %d: %s" % (seq, attempt, last_err), file=sys.stderr)
-                except Exception as exc:
-                    last_err = "upload failed: %s" % exc
-                    print("chunk %d attempt %d: %s" % (seq, attempt, last_err), file=sys.stderr)
-                if attempt < CHUNK_RETRIES:
-                    time.sleep(delay)
-                    delay = min(30, delay * 2)
-            if last_err:
-                _bail(last_err)
+                seq += 1
+                end = fh.tell()
+                is_last = 1 if end >= size else 0
+                query = "job=%s&seq=%d&last=%d&ext=.mkv&attempt=%s" % (
+                    JOB_ID, seq, is_last, ATTEMPT)
 
-            sent = end
-            speed = int(sent / max(0.001, time.time() - started))
-            if is_last:
-                # Everything is on the VPS: report a full bar and hand over.
-                report(stage="uploading", progress=100, speed_bps=speed,
-                       eta_seconds=0, out_size=size, message="Sent to VPS")
-                break  # the VPS takes over from here (to_pi -> done)
-            eta = int((size - sent) / speed) if speed else None
-            report(stage="uploading", progress=sent / size * 100,
-                   speed_bps=speed, eta_seconds=eta, out_size=size)
+                delay = 2
+                last_err = "upload failed"
+                for attempt in range(1, CHUNK_RETRIES + 1):
+                    try:
+                        up.post(query, chunk)
+                        last_err = None
+                        break
+                    except ChunkError as exc:
+                        if exc.code in (404, 409):
+                            print("job superseded or removed, stopping", file=sys.stderr)
+                            up.close()
+                            sys.exit(0)
+                        last_err = str(exc)
+                        print("chunk %d attempt %d: %s" % (seq, attempt, last_err), file=sys.stderr)
+                    except Exception as exc:
+                        last_err = "upload failed: %s" % exc
+                        print("chunk %d attempt %d: %s" % (seq, attempt, last_err), file=sys.stderr)
+                    if attempt < CHUNK_RETRIES:
+                        time.sleep(delay)
+                        delay = min(30, delay * 2)
+                if last_err:
+                    _bail(last_err)
+
+                sent = end
+                speed = int(sent / max(0.001, time.time() - started))
+                if is_last:
+                    # Everything is on the VPS: report a full bar and hand over.
+                    report(stage="uploading", progress=100, speed_bps=speed,
+                           eta_seconds=0, out_size=size, message="Sent to VPS")
+                    break  # the VPS takes over from here (to_pi -> done)
+                eta = int((size - sent) / speed) if speed else None
+                report(stage="uploading", progress=sent / size * 100,
+                       speed_bps=speed, eta_seconds=eta, out_size=size)
+    finally:
+        up.close()
     print("uploaded %s bytes in %d chunk(s)" % (size, seq))
 
 
