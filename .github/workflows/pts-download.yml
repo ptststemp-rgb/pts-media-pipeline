@@ -1,7 +1,7 @@
 name: pts-download
 
 # Triggered by the PTS Library backend when a job is added to the queue.
-# Stages: download -> compress (540p HEVC + 256k AAC, all audio tracks) ->
+# Stages: download -> sample-tested HEVC + channel-aware AAC, all tracks ->
 # upload to the VPS. The VPS then moves the file to the Pi and clears the copy.
 on:
   workflow_dispatch:
