@@ -157,13 +157,16 @@ def probe_video(path):
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=codec_name,height", "-of", "csv=p=0:s=,", path],
+             "-show_entries", "stream=codec_name,height,r_frame_rate", "-of", "csv=p=0:s=,", path],
             capture_output=True, text=True, check=True)
-        codec, _, height = out.stdout.strip().partition(",")
-        return codec.strip().lower(), int(height or 0)
+        codec, _, rest = out.stdout.strip().partition(",")
+        height, _, rate = rest.partition(",")
+        num, _, den = rate.partition("/")
+        fps = float(num) / float(den or 1) if num else 0.0
+        return codec.strip().lower(), int(height or 0), fps
     except Exception as exc:
         print("video probe failed: %s" % exc, file=sys.stderr)
-        return "", 0
+        return "", 0, 0.0
 
 
 def compress(src, dst):
@@ -177,21 +180,19 @@ def compress(src, dst):
     cmd = ["ffmpeg", "-hide_banner", "-y", "-i", src,
            "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?",
            "-map_metadata", "0"]
-    codec, height = probe_video(src)
-    if codec in ("hevc", "h265") and 0 < height <= 540:
-        # Already the target codec and size: a stream copy finishes in seconds.
-        cmd += ["-c:v", "copy"]
-        report(stage="compressing", progress=0, message="Source already 540p HEVC")
-    else:
-        cmd += [
-            "-c:v", "libx265", "-preset", "veryfast", "-crf", "27",
-            "-vf", "scale=-2:min(540\\,ih)",
-            "-x265-params", "log-level=error:wpp=1",
-            "-max_muxing_queue_size", "4096",
-        ]
-        report(stage="compressing", progress=0, message="Starting encoder")
-    cmd += ["-c:a", "aac", "-b:a", "256k", "-c:s", "copy",
-            "-progress", "pipe:1", "-nostats", dst]
+    _, _, fps = probe_video(src)
+    keyint = max(12, int(round((fps or 24.0) * 2)))
+    cmd += [
+        "-c:v", "libx265", "-preset", "medium", "-crf", "26",
+        "-vf", "scale=-2:min(540\\,ih)",
+        "-x265-params", "log-level=error:keyint=%d:min-keyint=%d" % (keyint, keyint),
+        "-c:a", "aac", "-b:a", "256k",
+        "-c:s", "copy",
+        "-max_muxing_queue_size", "4096",
+        "-reserve_index_space", "1048576",
+    ]
+    report(stage="compressing", progress=0, message="Starting encoder")
+    cmd += ["-progress", "pipe:1", "-nostats", dst]
 
     log = open("work/ffmpeg.log", "w+")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log,
