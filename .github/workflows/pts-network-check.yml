@@ -23,10 +23,18 @@ permissions:
 jobs:
   measure:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
         if: inputs.mode == 'smoke'
+      - name: Install encoder for smoke test
+        if: inputs.mode == 'smoke'
+        timeout-minutes: 2
+        run: |
+          if ! command -v ffmpeg >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
+          fi
       - name: Verify single-resolution encoder and resource guards
         if: inputs.mode == 'smoke'
         run: |
