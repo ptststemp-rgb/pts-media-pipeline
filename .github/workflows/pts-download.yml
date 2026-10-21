@@ -1,7 +1,7 @@
 name: pts-download
 
 # Triggered by the PTS Library backend when a job is added to the queue.
-# Stages: download -> sample-tested HEVC + channel-aware AAC, all tracks ->
+# Stages: download -> single-profile 720p HEVC + AAC, all tracks ->
 # upload to the VPS. The VPS then moves the file to the Pi and clears the copy.
 on:
   workflow_dispatch:
@@ -55,12 +55,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Ensure ffmpeg with HEVC support
+        timeout-minutes: 10
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
+          fi
           ffmpeg -hide_banner -encoders | grep -q libx265
 
       - name: Download, compress and upload
+        timeout-minutes: 330
         env:
           JOB_ID: ${{ inputs.job_id }}
           SOURCE_URL: ${{ inputs.url }}
@@ -77,6 +81,7 @@ jobs:
 
       - name: Report failure
         if: failure()
+        timeout-minutes: 2
         env:
           JOB_ID: ${{ inputs.job_id }}
           CALLBACK: ${{ inputs.callback }}

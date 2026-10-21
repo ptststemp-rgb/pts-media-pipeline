@@ -9,6 +9,13 @@ on:
       attempt:
         description: Temporary diagnostic attempt
         required: true
+      mode:
+        description: Diagnostic mode
+        type: choice
+        options:
+          - network
+          - smoke
+        default: network
 
 permissions:
   contents: read
@@ -18,7 +25,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@v4
+        if: inputs.mode == 'smoke'
+      - name: Verify single-resolution encoder and resource guards
+        if: inputs.mode == 'smoke'
+        run: |
+          python3 -m unittest discover -s tests -p test_storage_encode.py -v
+          python3 -u tests/smoke_runner.py scripts/pts_pipeline.py
       - name: Measure authenticated uploads without publishing a movie
+        if: inputs.mode != 'smoke'
         env:
           JOB_ID: ${{ inputs.job_id }}
           ATTEMPT: ${{ inputs.attempt }}

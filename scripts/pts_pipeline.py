@@ -18,6 +18,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -27,10 +28,70 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-CHUNK = 16 * 1024 * 1024  # bigger parts mean fewer requests and a warm TCP window
+CHUNK = 8 * 1024 * 1024
 CHUNK_RETRIES = 6
-UPLOAD_WORKERS = 4  # parallel connections: one TCP stream from a runner is slow
+UPLOAD_WORKERS = 8
 USER_AGENT = "pts-runner"
+OUTPUT_HEIGHT = 720
+RUNNER_SECONDS = 320 * 60
+UPLOAD_RESERVE_SECONDS = 60 * 60
+MIN_FREE_BYTES = 1 << 30
+BUDGET = None
+ABORT_REASON = ""
+
+
+class RunnerLimitError(RuntimeError):
+    pass
+
+
+class RunnerBudget:
+    def __init__(self, seconds=RUNNER_SECONDS):
+        self.deadline = time.monotonic() + seconds
+
+    def remaining(self, reserve=0):
+        return max(0, self.deadline - time.monotonic() - reserve)
+
+    def check(self):
+        if self.remaining() <= 0:
+            raise RunnerLimitError("Runner safety deadline reached before GitHub's six-hour limit")
+        if shutil.disk_usage(".").free < MIN_FREE_BYTES:
+            raise RunnerLimitError("Runner disk safety reserve reached; stopping before disk exhaustion")
+
+
+def check_resources():
+    if BUDGET is not None:
+        BUDGET.check()
+
+
+def encode_seconds_left():
+    return BUDGET.remaining(UPLOAD_RESERVE_SECONDS + 300) if BUDGET is not None else 4 * 3600
+
+
+def monitor_resources(stop):
+    global ABORT_REASON
+    while not stop.wait(5):
+        try:
+            check_resources()
+        except RunnerLimitError as exc:
+            ABORT_REASON = str(exc)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return
+
+
+def interrupted(signum, frame):
+    raise RunnerLimitError(ABORT_REASON or "Runner interrupted; no partial movie will be published")
+
+
+def stop_children():
+    try:
+        children = Path("/proc/%d/task/%d/children" % (os.getpid(), os.getpid())).read_text().split()
+        for pid in children:
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    except OSError:
+        pass
 
 
 def _bail(message):
@@ -90,9 +151,15 @@ DOWNLOAD_RETRIES = 3
 def download(url, dest):
     """Fetch the source, retrying a few times before giving up."""
     last_err = None
+    deadline = time.monotonic() + 40 * 60
+    max_bytes = max(0, (shutil.disk_usage(".").free - (2 << 30)) * 2 // 3)
+    if max_bytes < 64 << 20:
+        raise RunnerLimitError("Not enough runner disk space for source, output and safety reserve")
     for attempt in range(1, DOWNLOAD_RETRIES + 1):
         try:
-            return download_once(url, dest)
+            return download_once(url, dest, deadline, max_bytes)
+        except RunnerLimitError:
+            raise
         except Exception as exc:
             last_err = exc
             print("download attempt %d failed: %s" % (attempt, exc), file=sys.stderr)
@@ -102,7 +169,7 @@ def download(url, dest):
     _bail("download failed: %s" % last_err)
 
 
-def download_once(url, dest):
+def download_once(url, dest, deadline=None, max_bytes=None):
     print("downloading source")
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -116,10 +183,17 @@ def download_once(url, dest):
     done = 0
     with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as out:
         total = int(resp.headers.get("Content-Length") or 0)
+        if max_bytes is not None and total > max_bytes:
+            raise RunnerLimitError("Source is too large for the runner's safe working-disk budget")
         while True:
+            check_resources()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise RunnerLimitError("Source download exceeded its 40-minute budget")
             chunk = resp.read(262144)
             if not chunk:
                 break
+            if max_bytes is not None and done + len(chunk) > max_bytes:
+                raise RunnerLimitError("Source exceeds the runner's safe working-disk budget")
             out.write(chunk)
             done += len(chunk)
             now = time.time()
@@ -166,7 +240,7 @@ def audio_options(streams):
     args = []
     for i, stream in enumerate(s for s in streams if s.get("codec_type") == "audio"):
         channels = int(stream.get("channels") or 2)
-        target = 64000 if channels == 1 else 96000 if channels == 2 else 192000 if channels <= 6 else 256000
+        target = 96000 if channels == 1 else 128000 if channels == 2 else 256000 if channels <= 6 else 384000
         try:
             bitrate = int(stream.get("bit_rate") or 0)
         except (ValueError, TypeError):
@@ -174,8 +248,6 @@ def audio_options(streams):
         if stream.get("codec_name") == "aac" and (not bitrate or bitrate <= target * 1.05):
             args += ["-c:a:%d" % i, "copy"]
         else:
-            if bitrate:
-                target = min(target, bitrate)
             args += ["-c:a:%d" % i, "aac", "-b:a:%d" % i, str(target)]
     return args
 
@@ -211,7 +283,7 @@ def video_options(width, height, crf, preset="slow", pix_fmt="yuv420p", fps=24):
             "-x265-params", "log-level=error:keyint=%d:min-keyint=1" % keyint]
 
 
-def quality_score(encoded, reference, width, height, vmaf):
+def quality_score(encoded, reference, width, height, vmaf, timeout=120):
     if vmaf:
         graph = ("[0:v]scale=%d:%d:flags=lanczos,setpts=PTS-STARTPTS[d];"
                  "[1:v]setpts=PTS-STARTPTS[r];[d][r]libvmaf=n_threads=2" % (width, height))
@@ -224,7 +296,7 @@ def quality_score(encoded, reference, width, height, vmaf):
     if not vmaf:
         cmd += ["-map", "[s]", "-map", "[p]"]
     result = subprocess.run(cmd + ["-an", "-f", "null", "-"], capture_output=True, text=True,
-                            check=True, timeout=120)
+                            check=True, timeout=timeout)
     if vmaf:
         scores = re.findall(r"VMAF score: ([0-9.]+)", result.stderr)
         if not scores:
@@ -241,8 +313,7 @@ def quality_score(encoded, reference, width, height, vmaf):
 def choose_encode(src, doc):
     video = next(s for s in doc["streams"] if s["codec_type"] == "video")
     width, height = int(video["width"]), int(video["height"])
-    ref_w, ref_h = bounded_dimensions(width, height, 720)
-    small_w, small_h = bounded_dimensions(width, height, 540)
+    ref_w, ref_h = bounded_dimensions(width, height, OUTPUT_HEIGHT)
     pix_fmt = "yuv420p10le" if "10" in video.get("pix_fmt", "") else "yuv420p"
     try:
         n, d = video.get("avg_frame_rate", "24/1").split("/")
@@ -252,33 +323,52 @@ def choose_encode(src, doc):
     except (ValueError, ZeroDivisionError):
         fps = 24
     duration = float(doc.get("format", {}).get("duration") or 0)
-    fallback = video_options(ref_w, ref_h, 25, pix_fmt=pix_fmt, fps=fps)
+    preset = "medium"
+    fallback = video_options(ref_w, ref_h, 25, preset=preset, pix_fmt=pix_fmt, fps=fps)
     if duration < 12:
         return fallback, {"mode": "quality fallback", "height": ref_h, "crf": 25}
 
     work = Path("work/quality")
     work.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + 8 * 60
+    deadline = time.monotonic() + 180
     filters = subprocess.run(["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True, check=True)
     vmaf = "libvmaf" in filters.stdout
     metric = "VMAF" if vmaf else "SSIM/PSNR"
     report(stage="compressing", progress=0, message="Testing storage/quality (%s)" % metric)
-    print("Per-title quality selection: %s; no resolution upscaling" % metric, flush=True)
+    print("Single output profile %dx%d; quality selection %s; no upscaling" % (ref_w, ref_h, metric), flush=True)
+    def sample_run(cmd):
+        check_resources()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired("quality sample budget", 180)
+        return subprocess.run(cmd, capture_output=True, check=True, timeout=min(80, remaining))
     try:
         references = []
         for i, fraction in enumerate((0.18, 0.5, 0.78)):
             reference = work / ("ref%d.mkv" % i)
-            start = min(duration - 6, duration * fraction)
-            subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                            "-ss", str(start), "-i", str(src), "-t", "6", "-map", "0:v:0", "-an", "-sn",
+            start = min(duration - 4, duration * fraction)
+            sample_run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                            "-ss", str(start), "-i", str(src), "-t", "4", "-map", "0:v:0", "-an", "-sn",
                             "-vf", "scale=%d:%d:flags=lanczos" % (ref_w, ref_h), "-pix_fmt", pix_fmt,
                             "-c:v", "ffv1", "-threads", "2", "-map_metadata", "-1", "-map_chapters", "-1",
-                            str(reference)], capture_output=True, check=True, timeout=90)
+                            str(reference)])
             references.append(reference)
 
+        candidate = work / "candidate.mkv"
+        for preset in ("slow", "medium", "fast"):
+            began = time.monotonic()
+            sample_run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(references[0])] +
+                       video_options(ref_w, ref_h, 27, preset=preset, pix_fmt=pix_fmt, fps=fps) +
+                       ["-an", "-map_metadata", "-1", str(candidate)])
+            estimated = (time.monotonic() - began) / 4 * duration * 1.35
+            print("Preset %s: estimated full encode %.1f min; available %.1f min" %
+                  (preset, estimated / 60, encode_seconds_left() / 60), flush=True)
+            if estimated <= encode_seconds_left():
+                break
+        else:
+            raise RunnerLimitError("This title cannot be safely encoded within the remaining runner time budget")
+        fallback = video_options(ref_w, ref_h, 25, preset=preset, pix_fmt=pix_fmt, fps=fps)
         plans = [(ref_w, ref_h, q) for q in (25, 27, 29, 31)]
-        if (small_w, small_h) != (ref_w, ref_h):
-            plans += [(small_w, small_h, q) for q in (25, 27, 29)]
         accepted = []
         for w, h, crf in plans:
             if time.monotonic() >= deadline:
@@ -289,11 +379,14 @@ def choose_encode(src, doc):
                 if time.monotonic() >= deadline:
                     break
                 candidate = work / "candidate.mkv"
-                args = video_options(w, h, crf, pix_fmt=pix_fmt, fps=fps)
-                subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                                "-i", str(reference)] + args + ["-an", "-map_metadata", "-1", str(candidate)],
-                               capture_output=True, check=True, timeout=180)
-                scores.append(quality_score(candidate, reference, ref_w, ref_h, vmaf))
+                args = video_options(w, h, crf, preset=preset, pix_fmt=pix_fmt, fps=fps)
+                try:
+                    sample_run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                                "-i", str(reference)] + args + ["-an", "-map_metadata", "-1", str(candidate)])
+                    scores.append(quality_score(candidate, reference, ref_w, ref_h, vmaf,
+                                               timeout=max(0.1, min(60, deadline - time.monotonic()))))
+                except subprocess.TimeoutExpired:
+                    break
                 sizes.append(candidate.stat().st_size)
                 if scores[-1] < (88 if vmaf else 97):
                     break
@@ -309,11 +402,13 @@ def choose_encode(src, doc):
 
         if not accepted:
             print("No storage candidate passed; preserving quality with conservative CRF 23", flush=True)
-            return video_options(ref_w, ref_h, 23, pix_fmt=pix_fmt, fps=fps), {"mode": "quality fallback", "height": ref_h, "crf": 23}
+            return video_options(ref_w, ref_h, 23, preset=preset, pix_fmt=pix_fmt, fps=fps), {"mode": "quality fallback", "height": ref_h, "crf": 23, "preset": preset}
         size, w, h, crf, score = min(accepted)
-        details = {"mode": "sample tested", "metric": metric, "score": round(score, 2), "width": w, "height": h, "crf": crf}
+        details = {"mode": "sample tested", "metric": metric, "score": round(score, 2), "width": w, "height": h, "crf": crf, "preset": preset}
         print("Selected smallest passing sample: " + json.dumps(details), flush=True)
-        return video_options(w, h, crf, pix_fmt=pix_fmt, fps=fps), details
+        return video_options(w, h, crf, preset=preset, pix_fmt=pix_fmt, fps=fps), details
+    except RunnerLimitError:
+        raise
     except (subprocess.SubprocessError, ValueError, KeyError, RuntimeError) as exc:
         print("Quality selection unavailable (%s); using conservative fallback" % type(exc).__name__, flush=True)
         return fallback, {"mode": "quality fallback", "height": ref_h, "crf": 25}
@@ -342,55 +437,77 @@ def compress(src, dst):
     cmd += ["-progress", "pipe:1", "-nostats", dst]
 
     log = open("work/ffmpeg.log", "w+")
+    check_resources()
+    available = encode_seconds_left()
+    if available < 30:
+        raise RunnerLimitError("Not enough encoding time remains after reserving upload time")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log,
-                            universal_newlines=True, bufsize=1)
-
+                             universal_newlines=True, bufsize=1)
+    timed_out = threading.Event()
+    def stop_encoder():
+        timed_out.set()
+        if proc.poll() is None:
+            proc.kill()
+    timer = threading.Timer(available, stop_encoder)
+    timer.daemon = True
+    timer.start()
     state = {}
     last = 0.0
-    for line in proc.stdout:
-        line = line.strip()
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        state[key] = value
-        if key != "out_time":
-            continue
-        now = time.time()
-        if now - last < 3:
-            continue
-        last = now
-        try:
-            done_s = parse_hms(value)
-        except ValueError:
-            continue
-        pct = min(99.9, done_s / duration * 100) if duration else min(
-            99.9, 100.0 * (1.0 - math.exp(-(time.time() - started) / 600.0)))
-        try:
-            factor = float(state.get("speed", "").rstrip("x"))
-        except ValueError:
-            factor = 0.0
-        eta = int((duration - done_s) / factor) if (duration and factor > 0) else None
-        bits = [state.get("speed"), state.get("fps") and state["fps"] + " fps"]
-        report(stage="compressing", progress=pct, eta_seconds=eta,
-               message=" ".join(b for b in bits if b))
-
-    proc.wait()
-    log.flush()
-    log.seek(0)
-    tail = log.read()[-1500:]
-    log.close()
+    try:
+        for line in proc.stdout:
+            check_resources()
+            line = line.strip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            state[key] = value
+            if key != "out_time":
+                continue
+            now = time.time()
+            if now - last < 3:
+                continue
+            last = now
+            try:
+                done_s = parse_hms(value)
+            except ValueError:
+                continue
+            pct = min(99.9, done_s / duration * 100) if duration else min(
+                99.9, 100.0 * (1.0 - math.exp(-(time.time() - started) / 600.0)))
+            try:
+                factor = float(state.get("speed", "").rstrip("x"))
+            except ValueError:
+                factor = 0.0
+            eta = int((duration - done_s) / factor) if (duration and factor > 0) else None
+            bits = [state.get("speed"), state.get("fps") and state["fps"] + " fps"]
+            report(stage="compressing", progress=pct, eta_seconds=eta,
+                   message=" ".join(b for b in bits if b))
+        proc.wait()
+        log.flush()
+        log.seek(0)
+        tail = log.read()[-1500:]
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        log.close()
+    if timed_out.is_set():
+        raise RunnerLimitError("Encoding exceeded its safe time budget; upload reserve was protected")
     if proc.returncode != 0:
         _bail("ffmpeg failed (exit %s): %s" % (proc.returncode, tail.strip()))
 
     # If encoding grew an already compact source, try a lossless video remux
     # with the same audio policy instead. Keep the smaller valid output.
-    if os.path.getsize(dst) >= os.path.getsize(src):
+    video = next(s for s in doc["streams"] if s["codec_type"] == "video")
+    source_fits = bounded_dimensions(video["width"], video["height"], OUTPUT_HEIGHT) == (video["width"], video["height"])
+    if (source_fits and os.path.getsize(dst) >= os.path.getsize(src) and
+            shutil.disk_usage(".").free > os.path.getsize(src) + MIN_FREE_BYTES):
         alternative = dst + ".copy.mkv"
         copied = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
                                  "-i", str(src), "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?",
                                  "-map_metadata", "0", "-c:v", "copy"] + audio_options(doc["streams"]) +
                                 ["-c:s", "copy", "-reserve_index_space", index_space, alternative],
-                                capture_output=True, timeout=max(300, int(duration)))
+                                capture_output=True, timeout=max(1, min(max(300, int(duration)), encode_seconds_left())))
         if copied.returncode == 0 and os.path.getsize(alternative) < os.path.getsize(dst):
             os.replace(alternative, dst)
             plan = {"mode": "video copied: avoiding needless quality loss"}
@@ -399,7 +516,7 @@ def compress(src, dst):
 
     original_compatible = all(s.get("codec_name") in ("aac", "h264", "hevc")
                               for s in doc["streams"] if s.get("codec_type") in ("video", "audio"))
-    if (os.path.getsize(dst) >= os.path.getsize(src) and original_compatible and
+    if (source_fits and os.path.getsize(dst) >= os.path.getsize(src) and original_compatible and
             "matroska" in doc.get("format", {}).get("format_name", "")):
         shutil.copyfile(src, dst)
         plan = {"mode": "original retained: already smaller and compatible"}
@@ -451,7 +568,7 @@ class Uploader:
     def post(self, query, chunk):
         if self.conn is None:
             factory = http.client.HTTPSConnection if self.secure else http.client.HTTPConnection
-            self.conn = factory(self.host, self.port, timeout=900)
+            self.conn = factory(self.host, self.port, timeout=120)
         try:
             self.conn.request("POST", self.path + "?" + query, body=chunk, headers={
                 "Content-Type": "application/octet-stream",
@@ -472,7 +589,7 @@ def upload(path):
     """Send the finished file in parallel chunks over a few warm connections.
 
     A single TCP stream from a shared runner crawls (a couple hundred KB/s),
-    while the same chunks over four streams finish several times faster. Every
+    while the same chunks over eight streams finish several times faster. Every
     part is addressed by sequence number, so the order they land in does not
     matter, and the final part is held back until all the others are in.
     """
@@ -497,6 +614,7 @@ def upload(path):
         delay = 2
         last_err = "upload failed"
         for attempt in range(1, CHUNK_RETRIES + 1):
+            check_resources()
             try:
                 up.post(query, chunk)
                 last_err = None
@@ -535,6 +653,7 @@ def upload(path):
     prev = None
     with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as pool, open(path, "rb") as fh:
         while True:
+            check_resources()
             chunk = fh.read(CHUNK)
             if not chunk:
                 break
@@ -589,4 +708,16 @@ if __name__ == "__main__":
     if "--report-failure" not in sys.argv and not SOURCE_URL:
         print("SOURCE_URL is required", file=sys.stderr)
         sys.exit(2)
-    main()
+    stop = threading.Event()
+    if "--report-failure" not in sys.argv:
+        BUDGET = RunnerBudget()
+        signal.signal(signal.SIGTERM, interrupted)
+        signal.signal(signal.SIGINT, interrupted)
+        threading.Thread(target=monitor_resources, args=(stop,), daemon=True).start()
+    try:
+        main()
+    except Exception as exc:
+        stop_children()
+        _bail(str(exc))
+    finally:
+        stop.set()
