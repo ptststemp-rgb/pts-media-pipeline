@@ -236,19 +236,43 @@ def bounded_dimensions(width, height, limit):
     return max(2, int(width * factor) // 2 * 2), max(2, int(height * factor) // 2 * 2)
 
 
-def audio_options(streams):
-    args = []
-    for i, stream in enumerate(s for s in streams if s.get("codec_type") == "audio"):
+AUDIO_FLOOR = 256000
+
+
+def select_audio(streams):
+    audio = [s for s in streams if s.get("codec_type") == "audio"]
+    if len(audio) <= 1:
+        return audio
+    best = {}
+    for stream in audio:
+        lang = ((stream.get("tags") or {}).get("language") or "und")
         channels = int(stream.get("channels") or 2)
-        target = 96000 if channels == 1 else 128000 if channels == 2 else 256000 if channels <= 6 else 384000
         try:
             bitrate = int(stream.get("bit_rate") or 0)
         except (ValueError, TypeError):
             bitrate = 0
-        if stream.get("codec_name") == "aac" and (not bitrate or bitrate <= target * 1.05):
+        rank = (channels, bitrate)
+        current = best.get(lang)
+        if current is None or rank > current[0]:
+            best[lang] = (rank, stream)
+    selected = [entry[1] for entry in best.values()]
+    selected.sort(key=lambda s: s.get("index", 0))
+    return selected
+
+
+def audio_options(streams):
+    args = []
+    for i, stream in enumerate(streams):
+        try:
+            bitrate = int(stream.get("bit_rate") or 0)
+        except (ValueError, TypeError):
+            bitrate = 0
+        if stream.get("codec_name") == "aac" and (not bitrate or bitrate <= AUDIO_FLOOR * 1.05):
             args += ["-c:a:%d" % i, "copy"]
+        elif bitrate and bitrate < AUDIO_FLOOR:
+            args += ["-c:a:%d" % i, "aac", "-b:a:%d" % i, str(bitrate)]
         else:
-            args += ["-c:a:%d" % i, "aac", "-b:a:%d" % i, str(target)]
+            args += ["-c:a:%d" % i, "aac", "-b:a:%d" % i, str(AUDIO_FLOOR)]
     return args
 
 
@@ -276,7 +300,7 @@ def measure_audio_bitrates(src, doc):
         print("Audio bitrate measurement unavailable; avoiding blind AAC re-encoding", flush=True)
 
 
-def video_options(width, height, crf, preset="slow", pix_fmt="yuv420p", fps=24):
+def video_options(width, height, crf, preset="medium", pix_fmt="yuv420p", fps=24):
     keyint = max(12, int(round(fps * 4)))
     return ["-c:v", "libx265", "-preset", preset, "-crf", str(crf),
             "-vf", "scale=%d:%d:flags=lanczos" % (width, height), "-pix_fmt", pix_fmt,
@@ -355,17 +379,14 @@ def choose_encode(src, doc):
             references.append(reference)
 
         candidate = work / "candidate.mkv"
-        for preset in ("slow", "medium", "fast"):
-            began = time.monotonic()
-            sample_run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(references[0])] +
-                       video_options(ref_w, ref_h, 27, preset=preset, pix_fmt=pix_fmt, fps=fps) +
-                       ["-an", "-map_metadata", "-1", str(candidate)])
-            estimated = (time.monotonic() - began) / 4 * duration * 1.35
-            print("Preset %s: estimated full encode %.1f min; available %.1f min" %
-                  (preset, estimated / 60, encode_seconds_left() / 60), flush=True)
-            if estimated <= encode_seconds_left():
-                break
-        else:
+        began = time.monotonic()
+        sample_run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(references[0])] +
+                   video_options(ref_w, ref_h, 27, preset=preset, pix_fmt=pix_fmt, fps=fps) +
+                   ["-an", "-map_metadata", "-1", str(candidate)])
+        estimated = (time.monotonic() - began) / 4 * duration * 1.35
+        print("Preset %s: estimated full encode %.1f min; available %.1f min" %
+              (preset, estimated / 60, encode_seconds_left() / 60), flush=True)
+        if estimated > encode_seconds_left():
             raise RunnerLimitError("This title cannot be safely encoded within the remaining runner time budget")
         fallback = video_options(ref_w, ref_h, 25, preset=preset, pix_fmt=pix_fmt, fps=fps)
         plans = [(ref_w, ref_h, q) for q in (25, 27, 29, 31)]
@@ -422,13 +443,19 @@ def compress(src, dst):
     duration = float(doc.get("format", {}).get("duration") or 0)
     index_space = str(min(1 << 20, max(4096, int(duration * 16) + 4096)))
     measure_audio_bitrates(src, doc)
+    audio = select_audio(doc["streams"])
+    if len(audio) < sum(1 for s in doc["streams"] if s.get("codec_type") == "audio"):
+        kept = ["%s %sch" % ((s.get("tags") or {}).get("language") or "und", s.get("channels") or 2) for s in audio]
+        print("Retaining one audio track per language: " + ", ".join(kept), flush=True)
     video_args, plan = choose_encode(src, doc)
     started = time.time()
 
-    cmd = ["ffmpeg", "-hide_banner", "-y", "-i", src,
-           "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?",
-           "-map_metadata", "0"]
-    cmd += video_args + audio_options(doc["streams"]) + [
+    audio_maps = []
+    for stream in audio:
+        audio_maps += ["-map", "0:%d" % stream["index"]]
+    cmd = ["ffmpeg", "-hide_banner", "-y", "-i", src, "-map", "0:v:0"] + audio_maps + [
+        "-map", "0:s?", "-map_metadata", "0"]
+    cmd += video_args + audio_options(audio) + [
         "-c:s", "copy",
         "-max_muxing_queue_size", "4096",
         "-reserve_index_space", index_space,
@@ -504,8 +531,8 @@ def compress(src, dst):
             shutil.disk_usage(".").free > os.path.getsize(src) + MIN_FREE_BYTES):
         alternative = dst + ".copy.mkv"
         copied = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                                 "-i", str(src), "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?",
-                                 "-map_metadata", "0", "-c:v", "copy"] + audio_options(doc["streams"]) +
+                                 "-i", str(src), "-map", "0:v:0"] + audio_maps + ["-map", "0:s?",
+                                 "-map_metadata", "0", "-c:v", "copy"] + audio_options(audio) +
                                 ["-c:s", "copy", "-reserve_index_space", index_space, alternative],
                                 capture_output=True, timeout=max(1, min(max(300, int(duration)), encode_seconds_left())))
         if copied.returncode == 0 and os.path.getsize(alternative) < os.path.getsize(dst):
@@ -516,15 +543,17 @@ def compress(src, dst):
 
     original_compatible = all(s.get("codec_name") in ("aac", "h264", "hevc")
                               for s in doc["streams"] if s.get("codec_type") in ("video", "audio"))
-    if (source_fits and os.path.getsize(dst) >= os.path.getsize(src) and original_compatible and
+    if (len(audio) == sum(1 for s in doc["streams"] if s.get("codec_type") == "audio") and
+            source_fits and os.path.getsize(dst) >= os.path.getsize(src) and original_compatible and
             "matroska" in doc.get("format", {}).get("format_name", "")):
         shutil.copyfile(src, dst)
         plan = {"mode": "original retained: already smaller and compatible"}
 
     final = probe_media(dst)
-    for kind in ("audio", "subtitle"):
-        if sum(s["codec_type"] == kind for s in final["streams"]) != sum(s["codec_type"] == kind for s in doc["streams"]):
-            _bail("output validation failed: missing %s tracks" % kind)
+    if sum(1 for s in final["streams"] if s["codec_type"] == "audio") != len(audio):
+        _bail("output validation failed: missing audio tracks")
+    if sum(1 for s in final["streams"] if s["codec_type"] == "subtitle") != sum(1 for s in doc["streams"] if s.get("codec_type") == "subtitle"):
+        _bail("output validation failed: missing subtitle tracks")
     final_duration = float(final.get("format", {}).get("duration") or 0)
     if duration > 0 and abs(final_duration - duration) > max(2, duration * 0.002):
         _bail("output validation failed: duration mismatch")

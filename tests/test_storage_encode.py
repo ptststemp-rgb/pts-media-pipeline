@@ -32,28 +32,39 @@ class StorageEncodeTests(unittest.TestCase):
             {"codec_type": "audio", "codec_name": "aac", "channels": 6, "tags": {"BPS": "640000"}}
         ]), ["-c:a:0", "copy"])
 
-    def test_retains_all_languages_and_surround(self):
-        audio = [{"codec_type": "video"}] + [
-            {"codec_type": "audio", "codec_name": "eac3", "channels": 6, "bit_rate": "192000"}
-            for _ in range(4)
-        ]
-        options = encoder.audio_options(audio)
-        self.assertEqual(len(options), 16)
-        self.assertNotIn("-ac", options)
-        for i in range(4):
-            self.assertEqual(options[i * 4:(i + 1) * 4], ["-c:a:%d" % i, "aac", "-b:a:%d" % i, "256000"])
+    def test_minimum_encode_target_is_256kbps(self):
+        options = encoder.audio_options([
+            {"codec_type": "audio", "codec_name": "mp3", "channels": 2}
+        ])
+        self.assertEqual(options, ["-c:a:0", "aac", "-b:a:0", "256000"])
 
-    def test_codec_conversion_uses_quality_target_not_source_codec_bitrate(self):
+    def test_preserves_source_quality_below_floor(self):
         options = encoder.audio_options([
             {"codec_type": "audio", "codec_name": "mp3", "channels": 2, "bit_rate": "80000"}
         ])
-        self.assertEqual(options[-1], "128000")
+        self.assertEqual(options[-1], "80000")
 
-    def test_all_channel_quality_targets(self):
-        for channels, bitrate in ((1, 96000), (2, 128000), (6, 256000), (8, 384000)):
-            with self.subTest(channels=channels):
-                options = encoder.audio_options([{"codec_type": "audio", "codec_name": "flac", "channels": channels}])
-                self.assertEqual(options[-1], str(bitrate))
+    def test_select_audio_keeps_one_track_per_language(self):
+        streams = [
+            {"codec_type": "video"},
+            {"index": 1, "codec_type": "audio", "channels": 2, "bit_rate": "192000", "tags": {"language": "eng"}},
+            {"index": 2, "codec_type": "audio", "channels": 6, "bit_rate": "640000", "tags": {"language": "eng"}},
+            {"index": 3, "codec_type": "audio", "channels": 2, "bit_rate": "128000", "tags": {"language": "tam"}},
+            {"index": 4, "codec_type": "audio", "channels": 6, "bit_rate": "384000", "tags": {"language": "tam"}},
+        ]
+        selected = encoder.select_audio(streams)
+        self.assertEqual([s["index"] for s in selected], [2, 4])
+
+    def test_select_audio_prefers_more_channels_then_bitrate(self):
+        streams = [
+            {"index": 1, "codec_type": "audio", "channels": 6, "bit_rate": "384000", "tags": {"language": "hin"}},
+            {"index": 2, "codec_type": "audio", "channels": 2, "bit_rate": "640000", "tags": {"language": "hin"}},
+        ]
+        self.assertEqual([s["index"] for s in encoder.select_audio(streams)], [1])
+
+    def test_select_audio_keeps_single_track(self):
+        streams = [{"index": 1, "codec_type": "audio", "channels": 2}]
+        self.assertEqual(encoder.select_audio(streams), streams)
 
     def test_single_resolution_profile(self):
         self.assertEqual(encoder.OUTPUT_HEIGHT, 720)
@@ -76,9 +87,9 @@ class StorageEncodeTests(unittest.TestCase):
             with self.assertRaises(encoder.RunnerLimitError):
                 encoder.RunnerBudget().check()
 
-    def test_storage_encoder_is_slow_and_uses_longer_gops(self):
+    def test_storage_encoder_uses_balanced_preset_and_longer_gops(self):
         options = encoder.video_options(960, 540, 29)
-        self.assertIn("slow", options)
+        self.assertIn("medium", options)
         self.assertIn("29", options)
         self.assertIn("log-level=error:keyint=96:min-keyint=1", options)
 
