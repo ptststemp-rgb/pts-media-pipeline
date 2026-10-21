@@ -1,0 +1,53 @@
+name: PTS upload diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Temporary diagnostic job ID
+        required: true
+      attempt:
+        description: Temporary diagnostic attempt
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Measure authenticated uploads without publishing a movie
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          ATTEMPT: ${{ inputs.attempt }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: |
+          python3 -u - <<'PY'
+          import concurrent.futures, http.client, json, os, time, urllib.parse
+          payload = os.urandom(16 * 1024 * 1024)
+          for workers in (1, 4, 8):
+              size = len(payload) // workers
+              def upload(i):
+                  connection = http.client.HTTPSConnection('ptsmovies.online', timeout=120)
+                  query = urllib.parse.urlencode({'job': os.environ['JOB_ID'], 'attempt': os.environ['ATTEMPT'],
+                      'seq': workers * 100 + i + 1, 'last': 0, 'ext': '.mkv'})
+                  try:
+                      connection.request('POST', '/api/v1/worker/upload?' + query,
+                          body=payload[i*size:(i+1)*size], headers={
+                              'Authorization': 'Bearer ' + os.environ['WORKER_TOKEN'],
+                              'Content-Type': 'application/octet-stream', 'User-Agent': 'pts-network-check'})
+                      response = connection.getresponse()
+                      response.read()
+                      if response.status != 200:
+                          raise RuntimeError('Upload HTTP ' + str(response.status))
+                  finally:
+                      connection.close()
+              started = time.monotonic()
+              with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                  list(pool.map(upload, range(workers)))
+              elapsed = time.monotonic() - started
+              print('RESULT ' + json.dumps({'streams': workers, 'MiB': 16,
+                  'seconds': round(elapsed, 2), 'MiB_per_second': round(16 / elapsed, 3)}), flush=True)
+          PY
