@@ -14,61 +14,94 @@ spec.loader.exec_module(encoder)
 
 class StorageEncodeTests(unittest.TestCase):
     def test_does_not_upscale(self):
-        self.assertEqual(encoder.bounded_dimensions(640, 360, 720), (640, 360))
-        self.assertEqual(encoder.bounded_dimensions(1248, 520, 720), (1248, 520))
+        self.assertEqual(encoder.bounded_dimensions(640, 360, 540), (640, 360))
+        self.assertEqual(encoder.bounded_dimensions(854, 480, 540), (854, 480))
+        self.assertEqual(encoder.bounded_dimensions(960, 540, 540), (960, 540))
 
     def test_bounds_width_and_height(self):
-        self.assertEqual(encoder.bounded_dimensions(1920, 1080, 720), (1280, 720))
-        self.assertEqual(encoder.bounded_dimensions(3840, 1600, 720), (1280, 532))
         self.assertEqual(encoder.bounded_dimensions(1920, 1080, 540), (960, 540))
+        self.assertEqual(encoder.bounded_dimensions(1280, 720, 540), (960, 540))
+        self.assertEqual(encoder.bounded_dimensions(3840, 1600, 540), (960, 400))
 
-    def test_copies_low_bitrate_aac(self):
-        self.assertEqual(encoder.audio_options([
-            {"codec_type": "audio", "codec_name": "aac", "channels": 2, "bit_rate": "64000"}
-        ]), ["-c:a:0", "copy"])
+    def test_video_profile_is_fixed_hevc_crf23_medium_hvc1(self):
+        options = encoder.video_options(960, 540, 23)
+        self.assertIn("libx265", options)
+        self.assertIn("medium", options)
+        self.assertIn("23", options)
+        self.assertIn("yuv420p", options)
+        self.assertIn("hvc1", options)
+        i = options.index("-force_key_frames")
+        self.assertEqual(options[i + 1], "expr:gte(t,n_forced*2)")
+        self.assertNotIn("-reserve_index_space", options)
 
-    def test_does_not_trust_missing_aac_bitrate(self):
-        self.assertEqual(encoder.audio_options([
-            {"codec_type": "audio", "codec_name": "aac", "channels": 6, "tags": {"BPS": "640000"}}
-        ]), ["-c:a:0", "copy"])
+    def test_copies_compatible_stereo_aac(self):
+        for bitrate in ("128000", "160000", ""):
+            with self.subTest(bitrate=bitrate):
+                stream = {"codec_type": "audio", "codec_name": "aac", "channels": 2,
+                          "sample_rate": "48000"}
+                if bitrate:
+                    stream["bit_rate"] = bitrate
+                self.assertEqual(encoder.audio_options([stream]), ["-c:a:0", "copy"])
 
-    def test_minimum_encode_target_is_256kbps(self):
+    def test_reencodes_high_bitrate_aac_down_not_up(self):
         options = encoder.audio_options([
-            {"codec_type": "audio", "codec_name": "mp3", "channels": 2}
+            {"codec_type": "audio", "codec_name": "aac", "channels": 2,
+             "bit_rate": "256000", "sample_rate": "48000"}
         ])
-        self.assertEqual(options, ["-c:a:0", "aac", "-b:a:0", "256000"])
+        self.assertEqual(options, ["-c:a:0", "aac", "-b:a:0", "160000", "-ac:a:0", "2", "-ar:a:0", "48000"])
 
-    def test_preserves_source_quality_below_floor(self):
-        options = encoder.audio_options([
-            {"codec_type": "audio", "codec_name": "mp3", "channels": 2, "bit_rate": "80000"}
-        ])
-        self.assertEqual(options[-1], "80000")
+    def test_transcodes_surround_and_other_codecs_to_aac_stereo_160k(self):
+        for codec, channels in (("eac3", 6), ("ac3", 6), ("dts", 8), ("eac3", 2)):
+            with self.subTest(codec=codec, channels=channels):
+                options = encoder.audio_options([
+                    {"codec_type": "audio", "codec_name": codec, "channels": channels,
+                     "sample_rate": "48000"}
+                ])
+                self.assertEqual(options, ["-c:a:0", "aac", "-b:a:0", "160000",
+                                           "-ac:a:0", "2", "-ar:a:0", "48000"])
 
-    def test_select_audio_keeps_one_track_per_language(self):
+    def test_select_audio_prefers_stereo_and_drops_duplicate_surround(self):
         streams = [
             {"codec_type": "video"},
-            {"index": 1, "codec_type": "audio", "channels": 2, "bit_rate": "192000", "tags": {"language": "eng"}},
-            {"index": 2, "codec_type": "audio", "channels": 6, "bit_rate": "640000", "tags": {"language": "eng"}},
-            {"index": 3, "codec_type": "audio", "channels": 2, "bit_rate": "128000", "tags": {"language": "tam"}},
-            {"index": 4, "codec_type": "audio", "channels": 6, "bit_rate": "384000", "tags": {"language": "tam"}},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac", "channels": 2,
+             "bit_rate": "128000", "tags": {"language": "eng"}},
+            {"index": 2, "codec_type": "audio", "codec_name": "eac3", "channels": 6,
+             "bit_rate": "640000", "tags": {"language": "eng"}},
+            {"index": 3, "codec_type": "audio", "codec_name": "aac", "channels": 2,
+             "bit_rate": "128000", "tags": {"language": "tel"}},
+            {"index": 4, "codec_type": "audio", "codec_name": "eac3", "channels": 6,
+             "bit_rate": "640000", "tags": {"language": "tel"}},
+            {"index": 5, "codec_type": "audio", "codec_name": "eac3", "channels": 6,
+             "bit_rate": "640000", "tags": {"language": "hin"}},
         ]
         selected = encoder.select_audio(streams)
-        self.assertEqual([s["index"] for s in selected], [2, 4])
+        self.assertEqual([s["index"] for s in selected], [1, 3, 5])
 
-    def test_select_audio_prefers_more_channels_then_bitrate(self):
+    def test_select_audio_keeps_surround_only_language(self):
         streams = [
-            {"index": 1, "codec_type": "audio", "channels": 6, "bit_rate": "384000", "tags": {"language": "hin"}},
-            {"index": 2, "codec_type": "audio", "channels": 2, "bit_rate": "640000", "tags": {"language": "hin"}},
+            {"index": 1, "codec_type": "audio", "codec_name": "eac3", "channels": 6,
+             "bit_rate": "384000", "tags": {"language": "hin"}},
+            {"index": 2, "codec_type": "audio", "codec_name": "eac3", "channels": 8,
+             "bit_rate": "640000", "tags": {"language": "hin"}},
         ]
-        self.assertEqual([s["index"] for s in encoder.select_audio(streams)], [1])
+        self.assertEqual([s["index"] for s in encoder.select_audio(streams)], [2])
 
     def test_select_audio_keeps_single_track(self):
         streams = [{"index": 1, "codec_type": "audio", "channels": 2}]
         self.assertEqual(encoder.select_audio(streams), streams)
 
+    def test_audio_metadata_preserves_language_and_title(self):
+        streams = [
+            {"codec_type": "audio", "tags": {"language": "eng", "title": "English"}},
+            {"codec_type": "audio", "tags": {"language": "hin"}},
+        ]
+        self.assertEqual(encoder.audio_metadata(streams), [
+            "-metadata:s:a:0", "language=eng", "-metadata:s:a:0", "title=English",
+            "-metadata:s:a:1", "language=hin",
+        ])
+
     def test_single_resolution_profile(self):
-        self.assertEqual(encoder.OUTPUT_HEIGHT, 720)
-        self.assertEqual(encoder.bounded_dimensions(1920, 1080, encoder.OUTPUT_HEIGHT), (1280, 720))
+        self.assertEqual(encoder.OUTPUT_HEIGHT, 540)
 
     def test_eight_bounded_upload_connections(self):
         self.assertEqual(encoder.UPLOAD_WORKERS, 8)
@@ -86,12 +119,6 @@ class StorageEncodeTests(unittest.TestCase):
         with patch.object(encoder.shutil, "disk_usage", return_value=type("Disk", (), {"free": 1000})()):
             with self.assertRaises(encoder.RunnerLimitError):
                 encoder.RunnerBudget().check()
-
-    def test_storage_encoder_uses_balanced_preset_and_longer_gops(self):
-        options = encoder.video_options(960, 540, 29)
-        self.assertIn("medium", options)
-        self.assertIn("29", options)
-        self.assertIn("log-level=error:keyint=96:min-keyint=1", options)
 
 
 if __name__ == "__main__":

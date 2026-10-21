@@ -32,7 +32,7 @@ CHUNK = 8 * 1024 * 1024
 CHUNK_RETRIES = 6
 UPLOAD_WORKERS = 8
 USER_AGENT = "pts-runner"
-OUTPUT_HEIGHT = 720
+OUTPUT_HEIGHT = 540
 RUNNER_SECONDS = 320 * 60
 UPLOAD_RESERVE_SECONDS = 60 * 60
 MIN_FREE_BYTES = 1 << 30
@@ -236,22 +236,34 @@ def bounded_dimensions(width, height, limit):
     return max(2, int(width * factor) // 2 * 2), max(2, int(height * factor) // 2 * 2)
 
 
-AUDIO_FLOOR = 256000
+AUDIO_BITRATE = 160000
 
 
 def select_audio(streams):
+    """One useful track per language, stereo preferred.
+
+    For each language keep the best stereo track; when a language has no
+    stereo track, keep its best surround track (downmixed during encoding)
+    so the language is never lost. Works for arbitrary languages.
+    """
     audio = [s for s in streams if s.get("codec_type") == "audio"]
     if len(audio) <= 1:
         return audio
+
+    def channels(stream):
+        return int(stream.get("channels") or 2)
+
+    def bitrate(stream):
+        try:
+            return int(stream.get("bit_rate") or 0)
+        except (ValueError, TypeError):
+            return 0
+
     best = {}
     for stream in audio:
         lang = ((stream.get("tags") or {}).get("language") or "und")
-        channels = int(stream.get("channels") or 2)
-        try:
-            bitrate = int(stream.get("bit_rate") or 0)
-        except (ValueError, TypeError):
-            bitrate = 0
-        rank = (channels, bitrate)
+        stereo = channels(stream) <= 2
+        rank = (stereo, bitrate(stream), channels(stream))
         current = best.get(lang)
         if current is None or rank > current[0]:
             best[lang] = (rank, stream)
@@ -261,18 +273,41 @@ def select_audio(streams):
 
 
 def audio_options(streams):
+    """Per-stream audio options.
+
+    Compatible stereo AAC at or below the target is copied untouched
+    (never up-encode to a higher bitrate). Everything else is transcoded
+    to AAC 160k stereo 48 kHz; surround-only languages are downmixed.
+    """
     args = []
     for i, stream in enumerate(streams):
         try:
             bitrate = int(stream.get("bit_rate") or 0)
         except (ValueError, TypeError):
             bitrate = 0
-        if stream.get("codec_name") == "aac" and (not bitrate or bitrate <= AUDIO_FLOOR * 1.05):
+        channels = int(stream.get("channels") or 2)
+        sample_rate = int(stream.get("sample_rate") or 0)
+        if (stream.get("codec_name") == "aac" and channels <= 2 and
+                (not bitrate or bitrate <= AUDIO_BITRATE * 1.05) and
+                (not sample_rate or sample_rate == 48000)):
             args += ["-c:a:%d" % i, "copy"]
-        elif bitrate and bitrate < AUDIO_FLOOR:
-            args += ["-c:a:%d" % i, "aac", "-b:a:%d" % i, str(bitrate)]
         else:
-            args += ["-c:a:%d" % i, "aac", "-b:a:%d" % i, str(AUDIO_FLOOR)]
+            args += ["-c:a:%d" % i, "aac", "-b:a:%d" % i, str(AUDIO_BITRATE),
+                     "-ac:a:%d" % i, "2", "-ar:a:%d" % i, "48000"]
+    return args
+
+
+def audio_metadata(streams):
+    """Preserve language and title metadata on every selected audio track."""
+    args = []
+    for i, stream in enumerate(streams):
+        tags = stream.get("tags") or {}
+        lang = tags.get("language")
+        if lang:
+            args += ["-metadata:s:a:%d" % i, "language=%s" % lang]
+        title = tags.get("title")
+        if title:
+            args += ["-metadata:s:a:%d" % i, "title=%s" % title]
     return args
 
 
@@ -300,148 +335,29 @@ def measure_audio_bitrates(src, doc):
         print("Audio bitrate measurement unavailable; avoiding blind AAC re-encoding", flush=True)
 
 
-def video_options(width, height, crf, preset="medium", pix_fmt="yuv420p", fps=24):
-    keyint = max(12, int(round(fps * 4)))
+def video_options(width, height, crf, preset="medium", pix_fmt="yuv420p"):
     return ["-c:v", "libx265", "-preset", preset, "-crf", str(crf),
             "-vf", "scale=%d:%d:flags=lanczos" % (width, height), "-pix_fmt", pix_fmt,
-            "-x265-params", "log-level=error:keyint=%d:min-keyint=1" % keyint]
-
-
-def quality_score(encoded, reference, width, height, vmaf, timeout=120):
-    if vmaf:
-        graph = ("[0:v]scale=%d:%d:flags=lanczos,setpts=PTS-STARTPTS[d];"
-                 "[1:v]setpts=PTS-STARTPTS[r];[d][r]libvmaf=n_threads=2" % (width, height))
-    else:
-        graph = ("[0:v]scale=%d:%d:flags=lanczos,setpts=PTS-STARTPTS,split[d1][d2];"
-                 "[1:v]setpts=PTS-STARTPTS,split[r1][r2];"
-                 "[d1][r1]ssim[s];[d2][r2]psnr[p]" % (width, height))
-    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-threads", "2", "-i", str(encoded),
-           "-threads", "2", "-i", str(reference), "-filter_complex_threads", "2", "-filter_complex", graph]
-    if not vmaf:
-        cmd += ["-map", "[s]", "-map", "[p]"]
-    result = subprocess.run(cmd + ["-an", "-f", "null", "-"], capture_output=True, text=True,
-                            check=True, timeout=timeout)
-    if vmaf:
-        scores = re.findall(r"VMAF score: ([0-9.]+)", result.stderr)
-        if not scores:
-            raise RuntimeError("VMAF did not produce a score")
-        return float(scores[-1])
-    ssim = re.findall(r"All:([0-9.]+)", result.stderr)
-    psnr = re.findall(r"average:([0-9.]+|inf)", result.stderr)
-    if not ssim or not psnr:
-        raise RuntimeError("Quality measurement did not produce a score")
-    # A combined guard avoids accepting high SSIM with severe blocking.
-    return min(float(ssim[-1]) * 100, 97 + (float(psnr[-1]) - 35) * 0.25)
+            "-tag:v", "hvc1",
+            "-force_key_frames", "expr:gte(t,n_forced*2)",
+            "-x265-params", "log-level=error"]
 
 
 def choose_encode(src, doc):
+    """Fixed storage profile: HEVC CRF 23, medium preset, max 540p, no upscaling."""
     video = next(s for s in doc["streams"] if s["codec_type"] == "video")
     width, height = int(video["width"]), int(video["height"])
     ref_w, ref_h = bounded_dimensions(width, height, OUTPUT_HEIGHT)
-    pix_fmt = "yuv420p10le" if "10" in video.get("pix_fmt", "") else "yuv420p"
-    try:
-        n, d = video.get("avg_frame_rate", "24/1").split("/")
-        fps = float(n) / float(d)
-        if not 1 <= fps <= 120:
-            fps = 24
-    except (ValueError, ZeroDivisionError):
-        fps = 24
-    duration = float(doc.get("format", {}).get("duration") or 0)
-    preset = "medium"
-    fallback = video_options(ref_w, ref_h, 25, preset=preset, pix_fmt=pix_fmt, fps=fps)
-    if duration < 12:
-        return fallback, {"mode": "quality fallback", "height": ref_h, "crf": 25}
-
-    work = Path("work/quality")
-    work.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + 180
-    filters = subprocess.run(["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True, check=True)
-    vmaf = "libvmaf" in filters.stdout
-    metric = "VMAF" if vmaf else "SSIM/PSNR"
-    report(stage="compressing", progress=0, message="Testing storage/quality (%s)" % metric)
-    print("Single output profile %dx%d; quality selection %s; no upscaling" % (ref_w, ref_h, metric), flush=True)
-    def sample_run(cmd):
-        check_resources()
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise subprocess.TimeoutExpired("quality sample budget", 180)
-        return subprocess.run(cmd, capture_output=True, check=True, timeout=min(80, remaining))
-    try:
-        references = []
-        for i, fraction in enumerate((0.18, 0.5, 0.78)):
-            reference = work / ("ref%d.mkv" % i)
-            start = min(duration - 4, duration * fraction)
-            sample_run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                            "-ss", str(start), "-i", str(src), "-t", "4", "-map", "0:v:0", "-an", "-sn",
-                            "-vf", "scale=%d:%d:flags=lanczos" % (ref_w, ref_h), "-pix_fmt", pix_fmt,
-                            "-c:v", "ffv1", "-threads", "2", "-map_metadata", "-1", "-map_chapters", "-1",
-                            str(reference)])
-            references.append(reference)
-
-        candidate = work / "candidate.mkv"
-        began = time.monotonic()
-        sample_run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(references[0])] +
-                   video_options(ref_w, ref_h, 27, preset=preset, pix_fmt=pix_fmt, fps=fps) +
-                   ["-an", "-map_metadata", "-1", str(candidate)])
-        estimated = (time.monotonic() - began) / 4 * duration * 1.35
-        print("Preset %s: estimated full encode %.1f min; available %.1f min" %
-              (preset, estimated / 60, encode_seconds_left() / 60), flush=True)
-        if estimated > encode_seconds_left():
-            raise RunnerLimitError("This title cannot be safely encoded within the remaining runner time budget")
-        fallback = video_options(ref_w, ref_h, 25, preset=preset, pix_fmt=pix_fmt, fps=fps)
-        plans = [(ref_w, ref_h, q) for q in (25, 27, 29, 31)]
-        accepted = []
-        for w, h, crf in plans:
-            if time.monotonic() >= deadline:
-                print("Sample-testing budget reached; using the best completed result", flush=True)
-                break
-            scores, sizes = [], []
-            for i, reference in enumerate(references):
-                if time.monotonic() >= deadline:
-                    break
-                candidate = work / "candidate.mkv"
-                args = video_options(w, h, crf, preset=preset, pix_fmt=pix_fmt, fps=fps)
-                try:
-                    sample_run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                                "-i", str(reference)] + args + ["-an", "-map_metadata", "-1", str(candidate)])
-                    scores.append(quality_score(candidate, reference, ref_w, ref_h, vmaf,
-                                               timeout=max(0.1, min(60, deadline - time.monotonic()))))
-                except subprocess.TimeoutExpired:
-                    break
-                sizes.append(candidate.stat().st_size)
-                if scores[-1] < (88 if vmaf else 97):
-                    break
-            if not scores:
-                break
-            mean = sum(scores) / len(scores)
-            passed = len(scores) == len(references) and min(scores) >= (88 if vmaf else 97) and mean >= (92 if vmaf else 97.5)
-            print("Sample %dx%d CRF %d: %s %.2f, minimum %.2f, %s" %
-                  (w, h, crf, metric, mean, min(scores), "pass" if passed else "reject"), flush=True)
-            if passed:
-                accepted.append((sum(sizes), w, h, crf, mean))
-            report(stage="compressing", progress=0, message="Quality tested: %dp / CRF %d" % (h, crf))
-
-        if not accepted:
-            print("No storage candidate passed; preserving quality with conservative CRF 23", flush=True)
-            return video_options(ref_w, ref_h, 23, preset=preset, pix_fmt=pix_fmt, fps=fps), {"mode": "quality fallback", "height": ref_h, "crf": 23, "preset": preset}
-        size, w, h, crf, score = min(accepted)
-        details = {"mode": "sample tested", "metric": metric, "score": round(score, 2), "width": w, "height": h, "crf": crf, "preset": preset}
-        print("Selected smallest passing sample: " + json.dumps(details), flush=True)
-        return video_options(w, h, crf, preset=preset, pix_fmt=pix_fmt, fps=fps), details
-    except RunnerLimitError:
-        raise
-    except (subprocess.SubprocessError, ValueError, KeyError, RuntimeError) as exc:
-        print("Quality selection unavailable (%s); using conservative fallback" % type(exc).__name__, flush=True)
-        return fallback, {"mode": "quality fallback", "height": ref_h, "crf": 25}
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    report(stage="compressing", progress=0, message="Encoding %dx%d HEVC CRF 23" % (ref_w, ref_h))
+    print("Fixed profile %dx%d HEVC CRF 23 medium; no upscaling" % (ref_w, ref_h), flush=True)
+    return video_options(ref_w, ref_h, 23), {"mode": "fixed profile", "width": ref_w,
+                                             "height": ref_h, "crf": 23, "preset": "medium"}
 
 
 def compress(src, dst):
     started = time.time()
     doc = probe_media(src)
     duration = float(doc.get("format", {}).get("duration") or 0)
-    index_space = str(min(1 << 20, max(4096, int(duration * 16) + 4096)))
     measure_audio_bitrates(src, doc)
     audio = select_audio(doc["streams"])
     if len(audio) < sum(1 for s in doc["streams"] if s.get("codec_type") == "audio"):
@@ -454,11 +370,10 @@ def compress(src, dst):
     for stream in audio:
         audio_maps += ["-map", "0:%d" % stream["index"]]
     cmd = ["ffmpeg", "-hide_banner", "-y", "-i", src, "-map", "0:v:0"] + audio_maps + [
-        "-map", "0:s?", "-map_metadata", "0"]
-    cmd += video_args + audio_options(audio) + [
-        "-c:s", "copy",
+        "-map_metadata", "0"]
+    cmd += video_args + audio_options(audio) + audio_metadata(audio) + [
         "-max_muxing_queue_size", "4096",
-        "-reserve_index_space", index_space,
+        "-movflags", "+faststart",
     ]
     report(stage="compressing", progress=0, message="Starting encoder")
     cmd += ["-progress", "pipe:1", "-nostats", dst]
@@ -523,37 +438,9 @@ def compress(src, dst):
     if proc.returncode != 0:
         _bail("ffmpeg failed (exit %s): %s" % (proc.returncode, tail.strip()))
 
-    # If encoding grew an already compact source, try a lossless video remux
-    # with the same audio policy instead. Keep the smaller valid output.
-    video = next(s for s in doc["streams"] if s["codec_type"] == "video")
-    source_fits = bounded_dimensions(video["width"], video["height"], OUTPUT_HEIGHT) == (video["width"], video["height"])
-    if (source_fits and os.path.getsize(dst) >= os.path.getsize(src) and
-            shutil.disk_usage(".").free > os.path.getsize(src) + MIN_FREE_BYTES):
-        alternative = dst + ".copy.mkv"
-        copied = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                                 "-i", str(src), "-map", "0:v:0"] + audio_maps + ["-map", "0:s?",
-                                 "-map_metadata", "0", "-c:v", "copy"] + audio_options(audio) +
-                                ["-c:s", "copy", "-reserve_index_space", index_space, alternative],
-                                capture_output=True, timeout=max(1, min(max(300, int(duration)), encode_seconds_left())))
-        if copied.returncode == 0 and os.path.getsize(alternative) < os.path.getsize(dst):
-            os.replace(alternative, dst)
-            plan = {"mode": "video copied: avoiding needless quality loss"}
-        if os.path.exists(alternative):
-            os.remove(alternative)
-
-    original_compatible = all(s.get("codec_name") in ("aac", "h264", "hevc")
-                              for s in doc["streams"] if s.get("codec_type") in ("video", "audio"))
-    if (len(audio) == sum(1 for s in doc["streams"] if s.get("codec_type") == "audio") and
-            source_fits and os.path.getsize(dst) >= os.path.getsize(src) and original_compatible and
-            "matroska" in doc.get("format", {}).get("format_name", "")):
-        shutil.copyfile(src, dst)
-        plan = {"mode": "original retained: already smaller and compatible"}
-
     final = probe_media(dst)
     if sum(1 for s in final["streams"] if s["codec_type"] == "audio") != len(audio):
         _bail("output validation failed: missing audio tracks")
-    if sum(1 for s in final["streams"] if s["codec_type"] == "subtitle") != sum(1 for s in doc["streams"] if s.get("codec_type") == "subtitle"):
-        _bail("output validation failed: missing subtitle tracks")
     final_duration = float(final.get("format", {}).get("duration") or 0)
     if duration > 0 and abs(final_duration - duration) > max(2, duration * 0.002):
         _bail("output validation failed: duration mismatch")
@@ -638,7 +525,7 @@ def upload(path):
         return up
 
     def push(seq, chunk, is_last):
-        query = "job=%s&seq=%d&last=%d&ext=.mkv&attempt=%s" % (JOB_ID, seq, is_last, ATTEMPT)
+        query = "job=%s&seq=%d&last=%d&ext=.mp4&attempt=%s" % (JOB_ID, seq, is_last, ATTEMPT)
         up = conn()
         delay = 2
         last_err = "upload failed"
@@ -711,7 +598,7 @@ def main():
     src = "work/source"
     download(SOURCE_URL, src)
 
-    dst = "work/out.mkv"
+    dst = "work/out.mp4"
     compress(src, dst)
 
     try:
