@@ -23,6 +23,7 @@ with tempfile.TemporaryDirectory(prefix='pts-quality-smoke-') as directory:
         '-f', 'lavfi', '-i', 'anullsrc=channel_layout=5.1:sample_rate=48000',
         '-f', 'lavfi', '-i', 'sine=frequency=800:sample_rate=48000',
         '-t', '18', '-map', '0:v', '-map', '1:a', '-map', '2:a', '-map', '3:a',
+        '-ac:a:0', '2', '-ac:a:2', '2',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '16', '-threads', '2',
         '-c:a:0', 'aac', '-b:a:0', '128000',
         '-c:a:1', 'eac3', '-b:a:1', '384000',
