@@ -1,8 +1,9 @@
-import concurrent.futures,hashlib,http.client,json,os,socket,ssl,threading,time,urllib.request
+import concurrent.futures,hashlib,http.client,json,os,socket,ssl,threading,time
+from pathlib import Path
 
 HOST='ptsmovies.online'
 ORIGIN='150.230.136.95'
-root=urllib.request.urlopen('https://developers.cloudflare.com/ssl/static/origin_ca_rsa_root.pem',timeout=30).read().decode()
+root=Path(__file__).with_name('cloudflare-origin-ca.pem').read_text()
 context=ssl.create_default_context(cadata=root)
 class DirectHTTPS(http.client.HTTPSConnection):
  def connect(self):
@@ -14,7 +15,7 @@ def connection(route):
 for route in ['cloudflare','direct']:
  conn=connection(route)
  try:
-  conn.request('POST','/api/v1/worker/upload?job=not-a-real-job',body=b'x',headers={'Content-Type':'application/octet-stream'})
+  conn.request('POST','/api/v1/worker/upload?job=not-a-real-job',body=b'x',headers={'Authorization':'Bearer invalid-test-token','Content-Type':'application/octet-stream','User-Agent':'pts-upload-route-check'})
   response=conn.getresponse();response.read()
   if response.status!=401:raise RuntimeError(route+' unauthenticated status '+str(response.status))
   print('AUTH '+json.dumps({'route':route,'status':response.status,'tls_verified':True}),flush=True)
