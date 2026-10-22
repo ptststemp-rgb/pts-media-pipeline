@@ -22,9 +22,11 @@ for route in ['cloudflare','direct']:
  finally:conn.close()
 payload=os.urandom(8*1024*1024)
 digest=hashlib.sha256(payload).hexdigest()
-sequence=0
+wide=os.environ.get('MODE')=='wide'
+sequence=100 if wide else 0
 results=[]
 cases=[('cloudflare',1,2),('direct',1,2),('cloudflare',8,1),('direct',8,1),('direct',16,1),('cloudflare',16,1),('direct',8,1),('cloudflare',8,1),('cloudflare',16,1),('direct',16,1)]
+if wide:cases=[('direct',8,1),('direct',16,1),('direct',32,1),('cloudflare',8,1),('cloudflare',32,1),('direct',16,1),('direct',32,1)]
 for route,workers,parts in cases:
  first=sequence+1
  sequence+=workers*parts
