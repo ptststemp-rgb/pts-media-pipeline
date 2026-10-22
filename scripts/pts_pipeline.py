@@ -12,6 +12,7 @@ Stages reported:
 The VPS owns the final stages (to_pi, done) once the upload lands.
 """
 import http.client
+import ipaddress
 import json
 import threading
 import math
@@ -19,6 +20,8 @@ import os
 import re
 import shutil
 import signal
+import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -462,6 +465,29 @@ class ChunkError(Exception):
         self.code = code
 
 
+def upload_worker_count():
+    try:
+        return max(1, min(32, int(os.environ.get("UPLOAD_WORKERS", UPLOAD_WORKERS))))
+    except ValueError:
+        return UPLOAD_WORKERS
+
+
+class VerifiedOriginConnection(http.client.HTTPSConnection):
+    def __init__(self, host, port, origin_ip, context):
+        super().__init__(host, port, timeout=120, context=context)
+        self.origin_ip = origin_ip
+
+    def connect(self):
+        raw = socket.create_connection((self.origin_ip, self.port), timeout=15)
+        try:
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+            self.sock.settimeout(self.timeout)
+        except BaseException:
+            raw.close()
+            raise
+
+
 class Uploader:
     """One warm HTTPS connection shared by every chunk of a file."""
 
@@ -472,6 +498,22 @@ class Uploader:
         self.port = parts.port
         self.path = parts.path.rstrip("/") + "/worker/upload"
         self.conn = None
+        self.direct_failures = 0
+        self.origin_ip = os.environ.get("UPLOAD_ORIGIN_IP", "").strip()
+        self.origin_context = None
+        if self.origin_ip:
+            ipaddress.ip_address(self.origin_ip)
+            if not self.secure:
+                raise ValueError("Direct uploads require HTTPS")
+            ca = os.environ.get("UPLOAD_CA_PEM", "").strip()
+            try:
+                if not ca:
+                    raise ValueError("Missing origin CA")
+                self.origin_context = ssl.create_default_context(cadata=ca)
+                self.origin_context.set_alpn_protocols(["http/1.1"])
+            except (ValueError, ssl.SSLError):
+                self.origin_ip = ""
+                print("Direct upload CA unavailable; using protected HTTPS upload", file=sys.stderr)
 
     def close(self):
         if self.conn is not None:
@@ -483,8 +525,11 @@ class Uploader:
 
     def post(self, query, chunk):
         if self.conn is None:
-            factory = http.client.HTTPSConnection if self.secure else http.client.HTTPConnection
-            self.conn = factory(self.host, self.port, timeout=120)
+            if self.origin_ip:
+                self.conn = VerifiedOriginConnection(self.host, self.port, self.origin_ip, self.origin_context)
+            else:
+                factory = http.client.HTTPSConnection if self.secure else http.client.HTTPConnection
+                self.conn = factory(self.host, self.port, timeout=120)
         try:
             self.conn.request("POST", self.path + "?" + query, body=chunk, headers={
                 "Content-Type": "application/octet-stream",
@@ -496,8 +541,16 @@ class Uploader:
             body = resp.read()
             if resp.status >= 400:
                 raise ChunkError(resp.status, body[:300])
-        except Exception:
+        except ChunkError:
             self.close()
+            raise
+        except Exception as exc:
+            self.close()
+            if self.origin_ip:
+                self.direct_failures += 1
+                if isinstance(exc, ssl.SSLCertVerificationError) or self.direct_failures >= 2:
+                    self.origin_ip = ""
+                    print("Direct upload unavailable; falling back to protected HTTPS upload", file=sys.stderr)
             raise
 
 
@@ -510,6 +563,7 @@ def upload(path):
     matter, and the final part is held back until all the others are in.
     """
     size = os.path.getsize(path)
+    workers = upload_worker_count()
     started = time.time()
     report(stage="uploading", progress=0, out_size=size, message="Sending to VPS")
 
@@ -567,7 +621,7 @@ def upload(path):
     seq = 0
     pending = []
     prev = None
-    with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as pool, open(path, "rb") as fh:
+    with ThreadPoolExecutor(max_workers=workers) as pool, open(path, "rb") as fh:
         while True:
             check_resources()
             chunk = fh.read(CHUNK)
@@ -576,7 +630,7 @@ def upload(path):
             if prev is not None:
                 seq += 1
                 pending.append(pool.submit(push, seq, prev, False))
-                while len(pending) >= UPLOAD_WORKERS * 2:
+                while len(pending) >= workers * 2:
                     pending.pop(0).result()
             prev = chunk
         for job in pending:
