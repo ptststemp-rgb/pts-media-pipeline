@@ -239,7 +239,7 @@ def bounded_dimensions(width, height, limit):
     return max(2, int(width * factor) // 2 * 2), max(2, int(height * factor) // 2 * 2)
 
 
-AUDIO_BITRATE = 160000
+AUDIO_BITRATE = 128000
 
 
 def select_audio(streams):
@@ -284,7 +284,7 @@ def audio_options(streams):
 
     Compatible stereo AAC at or below the target is copied untouched
     (never up-encode to a higher bitrate). Everything else is transcoded
-    to AAC 160k stereo 48 kHz; surround-only languages are downmixed.
+    to AAC 128k stereo 48 kHz; surround-only languages are downmixed.
     """
     args = []
     for i, stream in enumerate(streams):
@@ -295,7 +295,7 @@ def audio_options(streams):
         channels = int(stream.get("channels") or 2)
         sample_rate = int(stream.get("sample_rate") or 0)
         if (stream.get("codec_name") == "aac" and channels <= 2 and
-                (not bitrate or bitrate <= AUDIO_BITRATE * 1.05) and
+                (0 < bitrate <= AUDIO_BITRATE * 1.05) and
                 (not sample_rate or sample_rate in (44100, 48000))):
             args += ["-c:a:%d" % i, "copy"]
         else:
@@ -558,7 +558,7 @@ class Uploader:
             raise
 
 
-def upload(path):
+def upload(path, extension=".mp4"):
     """Send the finished file in parallel chunks over a few warm connections.
 
     A single TCP stream from a shared runner crawls (a couple hundred KB/s),
@@ -583,7 +583,7 @@ def upload(path):
         return up
 
     def push(seq, chunk, is_last):
-        query = "job=%s&seq=%d&last=%d&ext=.mp4&attempt=%s" % (JOB_ID, seq, is_last, ATTEMPT)
+        query = "job=%s&seq=%d&last=%d&ext=%s&attempt=%s" % (JOB_ID, seq, is_last, extension, ATTEMPT)
         up = conn()
         delay = 2
         last_err = "upload failed"
@@ -646,6 +646,73 @@ def upload(path):
 
 
 # ---------------------------------------------------------------------------
+def package_hls(source, destination):
+    import hashlib
+    import re
+    import tarfile
+    source = Path(source)
+    destination = Path(destination)
+    destination.mkdir()
+    doc = probe_media(str(source))
+    video = next(s for s in doc["streams"] if s["codec_type"] == "video")
+    audio = [s for s in doc["streams"] if s["codec_type"] == "audio"]
+    if len(audio) > 32:
+        raise ValueError("Too many audio tracks for safe HLS packaging")
+    for i in range(1 + len(audio)):
+        (destination / ("v%d" % i)).mkdir()
+    variants = ["v:0,agroup:audio" if audio else "v:0"]
+    for i, stream in enumerate(audio):
+        lang = re.sub(r"[^a-zA-Z]", "", (stream.get("tags") or {}).get("language") or "und")[:8] or "und"
+        variants.append("a:%d,agroup:audio,language:%s,default:%s" % (i, lang, "yes" if i == 0 else "no"))
+    command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(source), "-map", "0:v:0"]
+    if audio:
+        command += ["-map", "0:a"]
+    command += ["-c", "copy", "-tag:v", "hvc1", "-f", "hls", "-hls_time", "2", "-hls_playlist_type", "vod",
+                "-hls_segment_type", "fmp4", "-hls_flags", "independent_segments", "-hls_fmp4_init_filename", "init_%v.mp4",
+                "-hls_segment_filename", str(destination / "v%v/seg_%05d.m4s"), "-var_stream_map", " ".join(variants),
+                "-master_pl_name", "master.m3u8", str(destination / "v%v/index.m3u8")]
+    report(stage="compressing", progress=99, message="Packaging single-quality HLS with 128 kbps audio")
+    remaining = BUDGET.remaining(UPLOAD_RESERVE_SECONDS) if BUDGET is not None else 1800
+    if remaining < 30:
+        raise RunnerLimitError("Not enough packaging time remains before the upload reserve")
+    subprocess.run(command, check=True, timeout=min(1800, int(remaining)))
+    init = (destination / "v0/init_0.mp4").read_bytes()
+    offset = init.index(b"hvcC") + 4
+    config = init[offset:offset + 13]
+    compatibility = int(format(int.from_bytes(config[2:6], "big"), "032b")[::-1], 2)
+    constraints = list(config[6:12])
+    while constraints and constraints[-1] == 0:
+        constraints.pop()
+    codec = "hvc1." + ("", "A", "B", "C")[config[1] >> 6] + str(config[1] & 31) + "." + format(compatibility, "X") + "." + ("H" if config[1] & 32 else "L") + str(config[12]) + "".join("." + format(value, "X") for value in constraints)
+    master = destination / "master.m3u8"
+    master.write_text(re.sub(r'hvc1[^,\"]+', codec, master.read_text(), count=1))
+    files = {}
+    for file in sorted(destination.rglob("*")):
+        if not file.is_file():
+            continue
+        check_resources()
+        digest = hashlib.sha256()
+        with file.open("rb") as incoming:
+            for block in iter(lambda: incoming.read(1024 * 1024), b""):
+                digest.update(block)
+        files[str(file.relative_to(destination))] = {"size": file.stat().st_size, "sha256": digest.hexdigest()}
+    metadata = {"version": 1, "duration": float(doc["format"]["duration"]), "video_codec": "hevc",
+                "video_mime": 'video/mp4; codecs="' + codec + '"', "width": video["width"], "height": video["height"],
+                "size": sum(file["size"] for file in files.values()), "audio_bitrate_target": AUDIO_BITRATE,
+                "audio": [{"i": i + 1, "lang": (stream.get("tags") or {}).get("language") or "und", "codec": "aac",
+                           "ch": stream.get("channels", 2), "title": (stream.get("tags") or {}).get("title", "")} for i, stream in enumerate(audio)],
+                "files": files}
+    (destination / "pts-hls.json").write_text(json.dumps(metadata, separators=(",", ":")))
+    summary = {key: metadata[key] for key in ("version", "size", "duration", "video_codec", "video_mime", "width", "height", "audio")}
+    (destination / "pts-info.json").write_text(json.dumps(summary, separators=(",", ":")))
+    archive = destination.with_suffix(".hls.tar")
+    with tarfile.open(archive, "w") as output:
+        for file in sorted(destination.rglob("*")):
+            output.add(file, arcname=str(file.relative_to(destination)), recursive=False)
+    print("HLS package: one HEVC video rendition, %d AAC languages, %d bytes" % (len(audio), metadata["size"]), flush=True)
+    return archive
+
+
 def main():
     if "--report-failure" in sys.argv:
         report(stage="failed", error="the runner job failed", finish=True)
@@ -664,7 +731,11 @@ def main():
     except OSError:
         pass
 
-    upload(dst)
+    package = package_hls(dst, "work/hls")
+    os.remove(dst)
+    import shutil
+    shutil.rmtree("work/hls")
+    upload(package, ".hls.tar")
     print("done - the VPS will move the file to the Pi")
 
 
