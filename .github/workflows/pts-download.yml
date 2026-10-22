@@ -10,8 +10,9 @@ on:
         description: PTS job id
         required: true
       url:
-        description: Source download URL
-        required: true
+        description: Internal source reference; never enter a download link
+        required: false
+        default: worker-source
       title:
         description: Title
         required: true
@@ -47,7 +48,6 @@ jobs:
     timeout-minutes: 360
     env:
       JOB_ID: ${{ inputs.job_id }}
-      SOURCE_URL: ${{ inputs.url }}
       MEDIA_TITLE: ${{ inputs.title }}
       MEDIA_YEAR: ${{ inputs.year }}
       MEDIA_KIND: ${{ inputs.kind }}
