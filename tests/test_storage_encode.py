@@ -103,6 +103,25 @@ class StorageEncodeTests(unittest.TestCase):
     def test_single_resolution_profile(self):
         self.assertEqual(encoder.OUTPUT_HEIGHT, 540)
 
+    def test_unknown_audio_tracks_are_not_discarded(self):
+        tracks = [{"index": i, "codec_type": "audio", "codec_name": "aac", "channels": 2} for i in (1, 2)]
+        self.assertEqual([s["index"] for s in encoder.select_audio(tracks)], [1, 2])
+        tracks[0]["tags"] = {"language": "und"}
+        tracks[1]["tags"] = {"language": "unknown"}
+        self.assertEqual(len(encoder.select_audio(tracks)), 2)
+
+    def test_compatible_44100_aac_is_copied(self):
+        options = encoder.audio_options([{"codec_name": "aac", "channels": 2, "bit_rate": "128000", "sample_rate": "44100"}])
+        self.assertEqual(options, ["-c:a:0", "copy"])
+
+    def test_workflow_never_exports_source_urls(self):
+        workflow = PATH.with_name("pts-download.yml")
+        if not workflow.exists():
+            workflow = PATH.parent.parent / ".github/workflows/pts-download.yml"
+        text = workflow.read_text()
+        self.assertNotIn("SOURCE_URL:", text)
+        self.assertNotIn("${{ inputs.url }}", text)
+
     def test_eight_bounded_upload_connections(self):
         self.assertEqual(encoder.UPLOAD_WORKERS, 8)
         self.assertEqual(encoder.CHUNK, 8 * 1024 * 1024)
