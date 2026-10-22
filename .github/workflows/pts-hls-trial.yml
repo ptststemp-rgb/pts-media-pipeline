@@ -1,0 +1,31 @@
+name: PTS isolated ten-minute HLS trial
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        required: true
+      attempt:
+        required: true
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+      ATTEMPT: ${{ inputs.attempt }}
+      WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+      UPLOAD_ORIGIN_IP: ${{ secrets.UPLOAD_ORIGIN_IP }}
+      UPLOAD_CA_PEM: ${{ vars.UPLOAD_CA_PEM }}
+      UPLOAD_WORKERS: ${{ vars.UPLOAD_WORKERS || '8' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure FFmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
+          fi
+      - name: Copy and package ten minutes without encoding
+        run: python3 -u tests/pts_hls_trial.py
