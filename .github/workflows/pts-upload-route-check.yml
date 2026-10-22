@@ -1,0 +1,22 @@
+name: PTS upload route benchmark
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        required: true
+      attempt:
+        required: true
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare authenticated upload routes with TLS verification
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          ATTEMPT: ${{ inputs.attempt }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: python3 -u tests/upload_route_benchmark.py
