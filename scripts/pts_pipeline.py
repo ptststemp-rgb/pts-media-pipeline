@@ -264,7 +264,11 @@ def select_audio(streams):
 
     best = {}
     for stream in audio:
-        lang = ((stream.get("tags") or {}).get("language") or "und")
+        lang = str((stream.get("tags") or {}).get("language") or "und").strip().lower()
+        aliases = {"en":"eng", "ta":"tam", "hi":"hin", "te":"tel", "ml":"mal", "kn":"kan"}
+        lang = aliases.get(lang, lang)
+        if lang in ("", "und", "unknown", "mul"):
+            lang = ("unknown", stream.get("index", id(stream)))
         stereo = channels(stream) <= 2
         rank = (stereo, bitrate(stream), channels(stream))
         current = best.get(lang)
@@ -292,7 +296,7 @@ def audio_options(streams):
         sample_rate = int(stream.get("sample_rate") or 0)
         if (stream.get("codec_name") == "aac" and channels <= 2 and
                 (not bitrate or bitrate <= AUDIO_BITRATE * 1.05) and
-                (not sample_rate or sample_rate == 48000)):
+                (not sample_rate or sample_rate in (44100, 48000))):
             args += ["-c:a:%d" % i, "copy"]
         else:
             args += ["-c:a:%d" % i, "aac", "-b:a:%d" % i, str(AUDIO_BITRATE),
@@ -664,6 +668,21 @@ def main():
     print("done - the VPS will move the file to the Pi")
 
 
+def fetch_source_url():
+    query = urllib.parse.urlencode({"job": JOB_ID, "attempt": ATTEMPT})
+    req = urllib.request.Request(CALLBACK + "/worker/source?" + query,
+                                 headers={"Authorization": "Bearer " + TOKEN, "User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        data = json.loads(response.read(65536))
+    url = data.get("url", "")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("https", "http") or not parts.hostname:
+        raise ValueError("The source link is invalid")
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print("::add-mask::" + url.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"), flush=True)
+    return url
+
+
 if __name__ == "__main__":
     JOB_ID = os.environ.get("JOB_ID", "").strip()
     CALLBACK = os.environ.get("CALLBACK", "").rstrip("/")
@@ -671,13 +690,10 @@ if __name__ == "__main__":
     if not (JOB_ID and CALLBACK and TOKEN):
         print("JOB_ID, CALLBACK and WORKER_TOKEN are required", file=sys.stderr)
         sys.exit(2)
-    SOURCE_URL = os.environ.get("SOURCE_URL", "")
+    SOURCE_URL = ""
     LABEL = os.environ.get("LABEL") or os.environ.get("MEDIA_TITLE") or "job"
     RUN_ID = os.environ.get("GITHUB_RUN_ID", "")
     ATTEMPT = os.environ.get("ATTEMPT", "").strip()
-    if "--report-failure" not in sys.argv and not SOURCE_URL:
-        print("SOURCE_URL is required", file=sys.stderr)
-        sys.exit(2)
     stop = threading.Event()
     if "--report-failure" not in sys.argv:
         BUDGET = RunnerBudget()
@@ -685,6 +701,8 @@ if __name__ == "__main__":
         signal.signal(signal.SIGINT, interrupted)
         threading.Thread(target=monitor_resources, args=(stop,), daemon=True).start()
     try:
+        if "--report-failure" not in sys.argv:
+            SOURCE_URL = fetch_source_url()
         main()
     except Exception as exc:
         stop_children()
