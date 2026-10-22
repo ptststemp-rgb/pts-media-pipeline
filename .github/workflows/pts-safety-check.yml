@@ -1,0 +1,29 @@
+name: PTS safety regression validation
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        required: true
+      attempt:
+        required: true
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+      ATTEMPT: ${{ inputs.attempt }}
+      WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+      UPLOAD_ORIGIN_IP: ${{ secrets.UPLOAD_ORIGIN_IP }}
+      UPLOAD_CA_PEM: ${{ vars.UPLOAD_CA_PEM }}
+      UPLOAD_WORKERS: ${{ vars.UPLOAD_WORKERS || '8' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check encoder and upload regressions
+        run: |
+          python3 -m unittest discover -s tests -p test_storage_encode.py -v
+          python3 -m unittest discover -s tests -p test_upload_transport.py -v
+      - name: Verify source-link privacy and nonpublishing upload integrity
+        run: python3 -u tests/pts_safety_smoke.py
