@@ -6,6 +6,12 @@ on:
         required: true
       attempt:
         required: true
+      mode:
+        type: choice
+        options:
+          - normal
+          - wide
+        default: normal
 permissions:
   contents: read
 jobs:
@@ -19,4 +25,5 @@ jobs:
           JOB_ID: ${{ inputs.job_id }}
           ATTEMPT: ${{ inputs.attempt }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+          MODE: ${{ inputs.mode }}
         run: python3 -u tests/upload_route_benchmark.py
