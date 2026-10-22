@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tarfile
@@ -42,6 +43,16 @@ variants = ['v:0,agroup:audio'] + ['a:' + str(i) + ',agroup:audio,language:' + l
 subprocess.run(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'warning', '-i', str(baseline), '-map', '0:v:0', '-map', '0:a', '-c', 'copy', '-tag:v', 'hvc1', '-f', 'hls', '-hls_time', '2', '-hls_playlist_type', 'vod', '-hls_segment_type', 'fmp4', '-hls_flags', 'independent_segments', '-hls_fmp4_init_filename', 'init_%v.mp4', '-hls_segment_filename', str(PACKAGE / 'v%v/seg_%05d.m4s'), '-var_stream_map', ' '.join(variants), '-master_pl_name', 'master.m3u8', str(PACKAGE / 'v%v/index.m3u8')], check=True, timeout=300)
 assert (PACKAGE / 'master.m3u8').is_file()
 master = (PACKAGE / 'master.m3u8').read_text()
+initialization = (PACKAGE / 'v0/init_0.mp4').read_bytes()
+offset = initialization.index(b'hvcC') + 4
+configuration = initialization[offset:offset + 13]
+compatibility = int(format(int.from_bytes(configuration[2:6], 'big'), '032b')[::-1], 2)
+constraints = list(configuration[6:12])
+while constraints and constraints[-1] == 0:
+    constraints.pop()
+codec = 'hvc1.' + ('', 'A', 'B', 'C')[configuration[1] >> 6] + str(configuration[1] & 31) + '.' + format(compatibility, 'X') + '.' + ('H' if configuration[1] & 32 else 'L') + str(configuration[12]) + ''.join('.' + format(value, 'X') for value in constraints)
+master = re.sub(r'hvc1[^,\"]+', codec, master, count=1)
+(PACKAGE / 'master.m3u8').write_text(master)
 assert master.count('#EXT-X-MEDIA:TYPE=AUDIO') == 4
 assert master.count('#EXT-X-STREAM-INF:') == 1
 assert 'hvc1' in master
@@ -64,6 +75,7 @@ report = {
     'duration': duration,
     'width': video['width'], 'height': video['height'],
     'video_codec': 'hevc', 'audio_codec': 'aac',
+    'video_mime': 'video/mp4; codecs="' + codec + '"',
     'languages': languages, 'video_renditions': 1,
     'segment_seconds': 2,
     'mp4_bytes': baseline.stat().st_size, 'hls_bytes': hls_bytes,
