@@ -1,0 +1,27 @@
+name: pts-hls-production-smoke
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        required: true
+      attempt:
+        required: true
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+      ATTEMPT: ${{ inputs.attempt }}
+      WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+      UPLOAD_ORIGIN_IP: ${{ secrets.UPLOAD_ORIGIN_IP }}
+      UPLOAD_CA_PEM: ${{ vars.UPLOAD_CA_PEM }}
+      UPLOAD_WORKERS: ${{ vars.UPLOAD_WORKERS || '8' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Encode and deliver disposable HLS clip
+        run: python3 -u tests/pts_hls_production_smoke.py
