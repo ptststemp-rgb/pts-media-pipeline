@@ -1,7 +1,7 @@
 name: pts-download
 
 # Triggered by the PTS Library backend when a job is added to the queue.
-# Stages: download -> 540p HEVC CRF23 HLS + AAC128 per language ->
+# Stages: download -> 540p HEVC CRF25 HLS + AAC128 per language ->
 # upload to the VPS. The VPS then moves the file to the Pi and clears the copy.
 on:
   workflow_dispatch:
