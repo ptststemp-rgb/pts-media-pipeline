@@ -243,11 +243,13 @@ AUDIO_BITRATE = 128000
 
 
 def select_audio(streams):
-    """One useful track per language, stereo preferred.
+    """One useful track per language, highest quality first.
 
-    For each language keep the best stereo track; when a language has no
-    stereo track, keep its best surround track (downmixed during encoding)
-    so the language is never lost. Works for arbitrary languages.
+    For each language keep the highest-bitrate track; when bitrates tie,
+    keep the one with more channels. High-bitrate tracks (for example a
+    640k surround mix) are downmixed and transcoded to AAC 128k stereo
+    during encoding, so every language ends up as one useful stereo track
+    at the target bitrate. Works for arbitrary languages.
     """
     audio = [s for s in streams if s.get("codec_type") == "audio"]
     if len(audio) <= 1:
@@ -269,8 +271,7 @@ def select_audio(streams):
         lang = aliases.get(lang, lang)
         if lang in ("", "und", "unknown", "mul"):
             lang = ("unknown", stream.get("index", id(stream)))
-        stereo = channels(stream) <= 2
-        rank = (stereo, bitrate(stream), channels(stream))
+        rank = (bitrate(stream), channels(stream))
         current = best.get(lang)
         if current is None or rank > current[0]:
             best[lang] = (rank, stream)
