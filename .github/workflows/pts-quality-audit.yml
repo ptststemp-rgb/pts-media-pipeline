@@ -1,0 +1,56 @@
+name: pts-quality-audit
+run-name: "Quality audit: ${{ inputs.job_id }}"
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        required: true
+      attempt:
+        required: true
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      AUDIT_JOB: ${{ inputs.job_id }}
+      AUDIT_ATTEMPT: ${{ inputs.attempt }}
+      WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bounded audit dependencies
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          sudo timeout --kill-after=10s 120s apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
+          sudo env DEBIAN_FRONTEND=noninteractive timeout --kill-after=10s 240s apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 install -y --no-install-recommends ffmpeg meson ninja-build nasm xxd
+          ffmpeg -hide_banner -encoders > "$RUNNER_TEMP/audit-encoders.txt"
+          grep -qw libx265 "$RUNNER_TEMP/audit-encoders.txt"
+      - name: Build pinned Netflix VMAF models and metrics
+        timeout-minutes: 10
+        run: |
+          git init vmaf
+          git -C vmaf remote add origin https://github.com/Netflix/vmaf.git
+          git -C vmaf fetch --depth 1 origin 17a67b238ce0539bdeafdc95961abac64fa16ea8
+          git -C vmaf checkout --detach FETCH_HEAD
+          meson setup vmaf/libvmaf/build vmaf/libvmaf --buildtype=release -Denable_tests=false -Denable_docs=false -Denable_float=true
+          ninja -C vmaf/libvmaf/build -j 2
+      - name: Verify metric engine before fetching private media
+        timeout-minutes: 2
+        run: |
+          mkdir -p work
+          ffmpeg -v error -f lavfi -i testsrc2=size=320x180:rate=24 -t 1 -pix_fmt yuv420p -f yuv4mpegpipe work/sanity.y4m
+          vmaf/libvmaf/build/tools/vmaf -r work/sanity.y4m -d work/sanity.y4m --model version=vmaf_v0.6.1:name=vmaf --model version=vmaf_v0.6.1neg:name=vmaf_neg --feature psnr --feature float_ssim --feature cambi --threads 2 --json --output work/sanity.json --quiet
+          python3 -c "import json; d=json.load(open('work/sanity.json')); assert {'vmaf','vmaf_neg','psnr_y','float_ssim','cambi'} <= set(d['pooled_metrics'])"
+          rm work/sanity.y4m work/sanity.json
+      - name: Audit sources and sample quality-size tradeoffs
+        timeout-minutes: 125
+        run: python3 -u tests/pts_quality_audit.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: paradise-quality-audit
+          path: work/results/
+          retention-days: 1
+          if-no-files-found: warn
