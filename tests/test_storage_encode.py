@@ -35,7 +35,7 @@ class StorageEncodeTests(unittest.TestCase):
         self.assertNotIn("-reserve_index_space", options)
 
     def test_copies_compatible_stereo_aac(self):
-        for bitrate in ("128000", "160000", ""):
+        for bitrate in ("96000", "128000"):
             with self.subTest(bitrate=bitrate):
                 stream = {"codec_type": "audio", "codec_name": "aac", "channels": 2,
                           "sample_rate": "48000"}
@@ -48,16 +48,16 @@ class StorageEncodeTests(unittest.TestCase):
             {"codec_type": "audio", "codec_name": "aac", "channels": 2,
              "bit_rate": "256000", "sample_rate": "48000"}
         ])
-        self.assertEqual(options, ["-c:a:0", "aac", "-b:a:0", "160000", "-ac:a:0", "2", "-ar:a:0", "48000"])
+        self.assertEqual(options, ["-c:a:0", "aac", "-b:a:0", "128000", "-ac:a:0", "2", "-ar:a:0", "48000"])
 
-    def test_transcodes_surround_and_other_codecs_to_aac_stereo_160k(self):
+    def test_transcodes_surround_and_other_codecs_to_aac_stereo_128k(self):
         for codec, channels in (("eac3", 6), ("ac3", 6), ("dts", 8), ("eac3", 2)):
             with self.subTest(codec=codec, channels=channels):
                 options = encoder.audio_options([
                     {"codec_type": "audio", "codec_name": codec, "channels": channels,
                      "sample_rate": "48000"}
                 ])
-                self.assertEqual(options, ["-c:a:0", "aac", "-b:a:0", "160000",
+                self.assertEqual(options, ["-c:a:0", "aac", "-b:a:0", "128000",
                                            "-ac:a:0", "2", "-ar:a:0", "48000"])
 
     def test_select_audio_prefers_stereo_and_drops_duplicate_surround(self):
@@ -102,6 +102,17 @@ class StorageEncodeTests(unittest.TestCase):
 
     def test_single_resolution_profile(self):
         self.assertEqual(encoder.OUTPUT_HEIGHT, 540)
+        self.assertEqual(encoder.AUDIO_BITRATE, 128000)
+
+    def test_unknown_bitrate_aac_does_not_bypass_128k_target(self):
+        options = encoder.audio_options([{"codec_name": "aac", "channels": 2, "sample_rate": "48000"}])
+        self.assertIn("128000", options)
+        self.assertNotIn("copy", options)
+
+    def test_previous_160k_audio_is_reduced_to_128k(self):
+        options = encoder.audio_options([{"codec_name": "aac", "channels": 2, "sample_rate": "48000", "bit_rate": "160000"}])
+        self.assertIn("128000", options)
+        self.assertNotIn("copy", options)
 
     def test_unknown_audio_tracks_are_not_discarded(self):
         tracks = [{"index": i, "codec_type": "audio", "codec_name": "aac", "channels": 2} for i in (1, 2)]
