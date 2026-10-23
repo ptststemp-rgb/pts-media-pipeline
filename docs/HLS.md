@@ -22,6 +22,8 @@ Requests and ownership persist in `stream_downloads`. A backend restart marks in
 
 ## Deployment
 
+FFmpeg setup uses visible package-manager output, two installation attempts, 15-second HTTP/HTTPS acquisition timeouts, a 20-second package-lock wait, and outer limits of 90 seconds for updating package indexes and 150 seconds for installing FFmpeg. FFmpeg, ffprobe and libx265 are verified before downloading a movie. The complete setup step remains limited to ten minutes. A failed setup can be retried on a fresh GitHub runner; changing the workflow does not change an already-running workflow attempt.
+
 Back up the database, binary, web assets, and nginx configuration. Install the Pi helper before starting the new backend; migrate `stream_downloads` and `stream_probes.video_mime`. Deploy backend source, embedded pipeline assets, schema, web assets, vendor library and license, and cleanup units together. Publish `.github/workflows/pts-download.yml` and `scripts/pts_pipeline.py` to the pipeline repository. Bump web asset and service-worker versions. Validate nginx, restart the backend, reload nginx, purge Cloudflare when a purge token is available, and verify public headers/assets plus authenticated HLS/range/download behavior.
 
 Tests use an isolated loopback staging backend and disposable media. A synthetic GitHub Actions clip verifies the production encoder, 128 kbps audio, HLS packaging, authenticated upload, Pi extraction, and publication. A test-only H.264 fixture exercises MSE playback in headless browsers lacking HEVC; production output remains HEVC. Physical iPhone/Safari verification still requires an actual supported device.
