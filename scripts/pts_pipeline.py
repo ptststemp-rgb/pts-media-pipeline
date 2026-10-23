@@ -343,7 +343,7 @@ def measure_audio_bitrates(src, doc):
         print("Audio bitrate measurement unavailable; avoiding blind AAC re-encoding", flush=True)
 
 
-def video_options(width, height, crf, preset="medium", pix_fmt="yuv420p"):
+def video_options(width, height, crf, preset="slow", pix_fmt="yuv420p"):
     return ["-c:v", "libx265", "-preset", preset, "-crf", str(crf),
             "-vf", "scale=%d:%d:flags=lanczos" % (width, height), "-pix_fmt", pix_fmt,
             "-tag:v", "hvc1",
@@ -352,14 +352,14 @@ def video_options(width, height, crf, preset="medium", pix_fmt="yuv420p"):
 
 
 def choose_encode(src, doc):
-    """Fixed storage profile: HEVC CRF 23, medium preset, max 540p, no upscaling."""
+    """Fixed storage profile: HEVC CRF 25, slow preset, max 540p, no upscaling."""
     video = next(s for s in doc["streams"] if s["codec_type"] == "video")
     width, height = int(video["width"]), int(video["height"])
     ref_w, ref_h = bounded_dimensions(width, height, OUTPUT_HEIGHT)
-    report(stage="compressing", progress=0, message="Encoding %dx%d HEVC CRF 23" % (ref_w, ref_h))
-    print("Fixed profile %dx%d HEVC CRF 23 medium; no upscaling" % (ref_w, ref_h), flush=True)
-    return video_options(ref_w, ref_h, 23), {"mode": "fixed profile", "width": ref_w,
-                                             "height": ref_h, "crf": 23, "preset": "medium"}
+    report(stage="compressing", progress=0, message="Encoding %dx%d HEVC CRF 25" % (ref_w, ref_h))
+    print("Fixed profile %dx%d HEVC CRF 25 slow; no upscaling" % (ref_w, ref_h), flush=True)
+    return video_options(ref_w, ref_h, 25), {"mode": "fixed profile", "width": ref_w,
+                                             "height": ref_h, "crf": 25, "preset": "slow"}
 
 
 def compress(src, dst):
