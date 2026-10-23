@@ -64,11 +64,39 @@ jobs:
       - name: Ensure ffmpeg with HEVC support
         timeout-minutes: 10
         run: |
+          set -euo pipefail
           if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq ffmpeg
+            installed=false
+            for attempt in 1 2; do
+              echo "Installing FFmpeg and ffprobe (attempt ${attempt}/2)"
+              if sudo timeout --kill-after=10s 90s apt-get \
+                   -o Acquire::Retries=1 -o Acquire::http::Timeout=15 \
+                   -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=20 update && \
+                 sudo env DEBIAN_FRONTEND=noninteractive timeout --kill-after=10s 150s apt-get \
+                   -o Acquire::Retries=1 -o Acquire::http::Timeout=15 \
+                   -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=20 \
+                   install -y --no-install-recommends ffmpeg; then
+                installed=true
+                break
+              fi
+              echo "FFmpeg installation attempt ${attempt} failed or timed out"
+              if [ "$attempt" -lt 2 ]; then sleep 5; fi
+            done
+            if [ "$installed" != true ]; then
+              echo "::error::FFmpeg setup failed after two bounded installation attempts. Retry this job on a fresh runner."
+              exit 1
+            fi
           fi
-          ffmpeg -hide_banner -encoders | grep -q libx265
+          command -v ffmpeg
+          command -v ffprobe
+          ffmpeg -version
+          ffprobe -version
+          ffmpeg -hide_banner -encoders > "$RUNNER_TEMP/pts-ffmpeg-encoders.txt"
+          if ! grep -qw libx265 "$RUNNER_TEMP/pts-ffmpeg-encoders.txt"; then
+            echo "::error::The installed FFmpeg does not include the libx265 HEVC encoder."
+            exit 1
+          fi
+          echo "FFmpeg, ffprobe and libx265 HEVC support verified"
 
       - name: Download, compress and upload
         timeout-minutes: 330
