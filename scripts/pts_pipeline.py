@@ -381,6 +381,7 @@ def compress(src, dst):
         "-map_metadata", "0"]
     cmd += video_args + audio_options(audio) + audio_metadata(audio) + [
         "-max_muxing_queue_size", "4096",
+        "-avoid_negative_ts", "make_zero", "-use_editlist", "0",
         "-movflags", "+faststart",
     ]
     report(stage="compressing", progress=0, message="Starting encoder")
@@ -447,6 +448,7 @@ def compress(src, dst):
         _bail("ffmpeg failed (exit %s): %s" % (proc.returncode, tail.strip()))
 
     final = probe_media(dst)
+    validate_progressive_mp4(dst, final)
     if sum(1 for s in final["streams"] if s["codec_type"] == "audio") != len(audio):
         _bail("output validation failed: missing audio tracks")
     final_duration = float(final.get("format", {}).get("duration") or 0)
@@ -459,6 +461,52 @@ def compress(src, dst):
     report(stage="compressing", progress=100, eta_seconds=0,
            message="%s; %.1f%% saved" % (human(size), reduction), out_size=size)
     return size
+
+
+def validate_progressive_mp4(file, doc=None):
+    """Reject incomplete, fragmented, or non-browser-ready output before upload."""
+    import struct
+    file = Path(file)
+    size = file.stat().st_size
+    moov = None
+    mdat = None
+    with file.open("rb") as stream:
+        offset = 0
+        while offset < size:
+            stream.seek(offset)
+            header = stream.read(8)
+            if len(header) != 8:
+                raise ValueError("Incomplete MP4 atom header")
+            length, kind = struct.unpack(">I4s", header)
+            minimum = 8
+            if length == 1:
+                extended = stream.read(8)
+                if len(extended) != 8:
+                    raise ValueError("Incomplete extended MP4 atom")
+                length = struct.unpack(">Q", extended)[0]
+                minimum = 16
+            elif length == 0:
+                length = size - offset
+            if length < minimum or offset + length > size:
+                raise ValueError("Invalid MP4 atom length")
+            if kind == b"moof":
+                raise ValueError("Fragmented MP4 is not the default delivery format")
+            if kind == b"moov":
+                moov = offset
+            if kind == b"mdat" and mdat is None:
+                mdat = offset
+            offset += length
+    if moov is None or mdat is None or moov >= mdat:
+        raise ValueError("MP4 index must precede media data (faststart)")
+    if doc is None:
+        doc = probe_media(str(file))
+    videos = [s for s in doc["streams"] if s["codec_type"] == "video"]
+    audio = [s for s in doc["streams"] if s["codec_type"] == "audio"]
+    if len(videos) != 1 or videos[0]["codec_name"] != "hevc" or videos[0].get("codec_tag_string") != "hvc1":
+        raise ValueError("Output must contain one hvc1 HEVC video track")
+    if any(s["codec_name"] != "aac" or int(s.get("channels", 0)) not in (1, 2) for s in audio):
+        raise ValueError("Output audio must be mono/stereo AAC")
+    return doc
 
 
 # ---------------------------------------------------------------------------
@@ -732,11 +780,9 @@ def main():
     except OSError:
         pass
 
-    package = package_hls(dst, "work/hls")
-    os.remove(dst)
-    import shutil
-    shutil.rmtree("work/hls")
-    upload(package, ".hls.tar")
+    # The validated, faststart MP4 is the final artifact. Keep it intact if the
+    # upload fails; VPS retries and legacy HLS transfers remain supported.
+    upload(dst, ".mp4")
     print("done - the VPS will move the file to the Pi")
 
 
