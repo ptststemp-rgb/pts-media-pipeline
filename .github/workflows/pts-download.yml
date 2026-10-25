@@ -59,7 +59,7 @@ jobs:
       WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
       UPLOAD_ORIGIN_IP: ${{ secrets.UPLOAD_ORIGIN_IP }}
       UPLOAD_CA_PEM: ${{ vars.UPLOAD_CA_PEM }}
-      UPLOAD_WORKERS: ${{ vars.UPLOAD_WORKERS || '8' }}
+      UPLOAD_WORKERS: ${{ vars.UPLOAD_WORKERS || '2' }}
     steps:
       - name: Ensure ffmpeg with HEVC support
         timeout-minutes: 10
