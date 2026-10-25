@@ -33,7 +33,7 @@ from pathlib import Path
 
 CHUNK = 8 * 1024 * 1024
 CHUNK_RETRIES = 6
-UPLOAD_WORKERS = 8
+UPLOAD_WORKERS = 2
 USER_AGENT = "pts-runner"
 OUTPUT_HEIGHT = 540
 RUNNER_SECONDS = 320 * 60
@@ -520,7 +520,7 @@ class ChunkError(Exception):
 
 def upload_worker_count():
     try:
-        return max(1, min(32, int(os.environ.get("UPLOAD_WORKERS", UPLOAD_WORKERS))))
+        return max(1, min(4, int(os.environ.get("UPLOAD_WORKERS", UPLOAD_WORKERS))))
     except ValueError:
         return UPLOAD_WORKERS
 
