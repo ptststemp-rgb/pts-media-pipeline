@@ -185,7 +185,10 @@ def download_once(url, dest, deadline=None, max_bytes=None):
     last = 0.0
     done = 0
     with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as out:
-        total = int(resp.headers.get("Content-Length") or 0)
+        try:
+            total = max(0, int(resp.headers.get("Content-Length") or 0))
+        except (ValueError, TypeError):
+            total = 0
         if max_bytes is not None and total > max_bytes:
             raise RunnerLimitError("Source is too large for the runner's safe working-disk budget")
         while True:
@@ -205,13 +208,8 @@ def download_once(url, dest, deadline=None, max_bytes=None):
             last = now
             speed = int(done / max(0.001, now - started))
             eta = int((total - done) / speed) if (total and speed) else None
-            if total:
-                pct = done / total * 100
-            else:
-                # No Content-Length: creep towards 95% on elapsed time so the
-                # queue still shows a real 0-100 bar instead of a stuck one.
-                pct = min(95.0, 100.0 * (1.0 - math.exp(-(now - started) / 120.0)))
-            msg = human(done) + (" / " + human(total) if total else "")
+            pct = min(100.0, done / total * 100) if total else 0
+            msg = human(done) + (" / " + human(total) if total else " downloaded (total unknown)")
             report(stage="downloading", progress=pct, speed_bps=speed,
                    eta_seconds=eta, file_size=done, message=msg)
 
