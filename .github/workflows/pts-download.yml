@@ -101,9 +101,13 @@ jobs:
       - name: Download, compress and upload
         timeout-minutes: 330
         run: |
-          curl -sL -o pts_pipeline.py \
+          python3 -m venv "$RUNNER_TEMP/pts-runtime"
+          "$RUNNER_TEMP/pts-runtime/bin/python" -m pip install --disable-pip-version-check 'requests==2.32.5'
+          curl -fsSL --retry 3 -o pts_pipeline.py \
             "https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/pts_pipeline.py"
-          python3 -u pts_pipeline.py
+          curl -fsSL --retry 3 -o pts_zip_source.py \
+            "https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/pts_zip_source.py"
+          "$RUNNER_TEMP/pts-runtime/bin/python" -u pts_pipeline.py
 
       - name: Report failure
         if: failure()
