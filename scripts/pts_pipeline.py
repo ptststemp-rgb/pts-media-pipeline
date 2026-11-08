@@ -768,7 +768,29 @@ def main():
     Path("work").mkdir(exist_ok=True)
 
     src = "work/source"
-    download(SOURCE_URL, src)
+    if SOURCE_MEMBER:
+        from pts_zip_source import extract, SourceError
+        # The temporary runner needs space for this member and the output; no
+        # ZIP is downloaded and the VPS never receives its contents.
+        check_resources()
+        report(stage="downloading", progress=0, message="Reading selected ZIP episode")
+        last_update = [0]
+        def on_zip_progress(done, total):
+            check_resources()
+            if done - last_update[0] >= 64 << 20 or done == total:
+                report(stage="downloading", progress=round(done * 100 / total, 1),
+                       file_size=total, message="Reading selected ZIP episode")
+                last_update[0] = done
+        try:
+            extract(SOURCE_URL, SOURCE_MEMBER, src, on_zip_progress)
+        except SourceError:
+            raise
+        except Exception:
+            # requests exceptions may include signed URLs: never print them in
+            # a public GitHub Actions log or send them to the job history.
+            raise SourceError("Could not read ZIP source; check link expiry and range support") from None
+    else:
+        download(SOURCE_URL, src)
 
     dst = "work/out.mp4"
     compress(src, dst)
@@ -796,7 +818,10 @@ def fetch_source_url():
         raise ValueError("The source link is invalid")
     if os.environ.get("GITHUB_ACTIONS") == "true":
         print("::add-mask::" + url.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"), flush=True)
-    return url
+    member = data.get("zip_member", "")
+    if not isinstance(member, str) or len(member.encode("utf-8")) > 1000:
+        raise ValueError("Invalid ZIP member name")
+    return url, member
 
 
 if __name__ == "__main__":
@@ -807,6 +832,7 @@ if __name__ == "__main__":
         print("JOB_ID, CALLBACK and WORKER_TOKEN are required", file=sys.stderr)
         sys.exit(2)
     SOURCE_URL = ""
+    SOURCE_MEMBER = ""
     LABEL = os.environ.get("LABEL") or os.environ.get("MEDIA_TITLE") or "job"
     RUN_ID = os.environ.get("GITHUB_RUN_ID", "")
     ATTEMPT = os.environ.get("ATTEMPT", "").strip()
@@ -818,7 +844,7 @@ if __name__ == "__main__":
         threading.Thread(target=monitor_resources, args=(stop,), daemon=True).start()
     try:
         if "--report-failure" not in sys.argv:
-            SOURCE_URL = fetch_source_url()
+            SOURCE_URL, SOURCE_MEMBER = fetch_source_url()
         main()
     except Exception as exc:
         stop_children()
