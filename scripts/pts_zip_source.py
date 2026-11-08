@@ -49,6 +49,8 @@ class RangedZip(io.RawIOBase):
         self.pos = 0
         self.cache_start = -1
         self.cache = b""
+        self.streaming = False
+        self._stream = None
         self._probe()
 
     def readable(self):
@@ -66,15 +68,23 @@ class RangedZip(io.RawIOBase):
         pos = (0, self.pos, self.size)[whence] + offset
         if pos < 0 or pos > self.size:
             raise SourceError("ZIP seek outside source")
+        if pos != self.pos:
+            self._close_stream()
         self.pos = pos
         return pos
 
+    def _close_stream(self):
+        if self._stream is not None:
+            self._stream.close()
+            self._stream = None
+
     def close(self):
+        self._close_stream()
         if self.owned_session:
             self.session.close()
         super().close()
 
-    def _range(self, start, end):
+    def _open_range(self, start, end):
         url = self.url
         for _ in range(6):
             public_host(url)
@@ -105,11 +115,19 @@ class RangedZip(io.RawIOBase):
             if length and int(length) != end - start + 1:
                 raise SourceError("ZIP range length mismatch")
             self.size = size
+            self.url = url
+            return response
+        except Exception:
+            response.close()
+            raise
+
+    def _range(self, start, end):
+        response = self._open_range(start, end)
+        try:
             # Stop at the requested length even if a server sends extra data.
             data = response.raw.read(end - start + 1)
             if len(data) != end - start + 1:
                 raise SourceError("Incomplete ZIP range")
-            self.url = url
             return data
         finally:
             response.close()
@@ -117,12 +135,35 @@ class RangedZip(io.RawIOBase):
     def _probe(self):
         self._range(0, 0)
 
+    def _read_stream(self, n):
+        out = bytearray()
+        failures = 0
+        while len(out) < n:
+            if self._stream is None:
+                self._stream = self._open_range(self.pos, self.size - 1)
+            try:
+                data = self._stream.raw.read(n - len(out))
+            except (OSError, requests.RequestException):
+                data = b""
+            if not data:
+                self._close_stream()
+                failures += 1
+                if failures >= 3:
+                    raise SourceError("ZIP source interrupted the selected episode read")
+                continue
+            failures = 0
+            out.extend(data)
+            self.pos += len(data)
+        return bytes(out)
+
     def read(self, n=-1):
         if n is None or n < 0:
             n = self.size - self.pos
         if n > INDEX_LIMIT:
             raise SourceError("ZIP reader requested an oversized range")
         n = min(n, self.size - self.pos)
+        if self.streaming and n:
+            return self._read_stream(n)
         out = bytearray()
         while len(out) < n:
             if not self.cache_start <= self.pos < self.cache_start + len(self.cache):
@@ -185,6 +226,7 @@ def extract(url, member, dest, report=None):
         if shutil.disk_usage(os.path.dirname(os.path.abspath(dest))).free < size + (2 << 30):
             raise SourceError("Runner does not have enough space for this episode and its output")
         # Failure leaves only a partial file on temporary runner disk.
+        source.streaming = True
         with archive.open(member) as incoming, open(dest, "wb") as outgoing:
             done = 0
             while True:
