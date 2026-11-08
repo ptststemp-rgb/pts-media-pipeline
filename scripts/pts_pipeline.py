@@ -783,7 +783,7 @@ def main():
                 last_update[0] = done
         try:
             extract(SOURCE_URL, SOURCE_MEMBER, src, on_zip_progress)
-        except SourceError:
+        except (SourceError, RunnerLimitError):
             raise
         except Exception:
             # requests exceptions may include signed URLs: never print them in
