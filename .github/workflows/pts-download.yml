@@ -65,6 +65,21 @@ jobs:
         timeout-minutes: 10
         run: |
           set -euo pipefail
+          # A scheduled runner can spend time installing FFmpeg before the
+          # download script begins. Report that work without exposing URLs.
+          python3 - <<'PY'
+          import json, os, urllib.request
+          try:
+              payload = json.dumps({"job_id": os.environ["JOB_ID"], "attempt": os.environ["ATTEMPT"],
+                                    "message": "Checking or installing FFmpeg on GitHub runner"}).encode()
+              request = urllib.request.Request(os.environ["CALLBACK"] + "/worker/progress", data=payload,
+                  headers={"Authorization": "Bearer " + os.environ["WORKER_TOKEN"],
+                           "Content-Type": "application/json"})
+              with urllib.request.urlopen(request, timeout=15):
+                  pass
+          except Exception:
+              pass  # Setup status is best-effort; do not break a healthy runner.
+          PY
           if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
             installed=false
             for attempt in 1 2; do
@@ -101,6 +116,19 @@ jobs:
       - name: Download, compress and upload
         timeout-minutes: 330
         run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          try:
+              payload = json.dumps({"job_id": os.environ["JOB_ID"], "attempt": os.environ["ATTEMPT"],
+                                    "message": "Installing Python dependencies on GitHub runner"}).encode()
+              request = urllib.request.Request(os.environ["CALLBACK"] + "/worker/progress", data=payload,
+                  headers={"Authorization": "Bearer " + os.environ["WORKER_TOKEN"],
+                           "Content-Type": "application/json"})
+              with urllib.request.urlopen(request, timeout=15):
+                  pass
+          except Exception:
+              pass  # Runner setup must not fail solely because status is unavailable.
+          PY
           python3 -m venv "$RUNNER_TEMP/pts-runtime"
           "$RUNNER_TEMP/pts-runtime/bin/python" -m pip install --disable-pip-version-check 'requests==2.32.5'
           curl -fsSL --retry 3 -o pts_pipeline.py \
